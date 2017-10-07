@@ -1,19 +1,13 @@
 path = require 'path'
-url = require 'url'
 
 _ = require 'underscore-plus'
 fs = require 'fs-plus'
-Q = require 'q'
-{includeDeprecatedAPIs, deprecate} = require 'grim'
-{Emitter} = require 'event-kit'
-Serializable = require 'serializable'
+{Emitter, Disposable} = require 'event-kit'
 TextBuffer = require 'text-buffer'
-Grim = require 'grim'
+{watchPath} = require('./path-watcher')
 
 DefaultDirectoryProvider = require './default-directory-provider'
 Model = require './model'
-TextEditor = require './text-editor'
-Task = require './task'
 GitRepositoryProvider = require './git-repository-provider'
 
 # Extended: Represents a project that's opened in Atom.
@@ -21,60 +15,43 @@ GitRepositoryProvider = require './git-repository-provider'
 # An instance of this class is always available as the `atom.project` global.
 module.exports =
 class Project extends Model
-  atom.deserializers.add(this)
-  Serializable.includeInto(this)
-
   ###
   Section: Construction and Destruction
   ###
 
-  constructor: ({path, paths, @buffers}={}) ->
+  constructor: ({@notificationManager, packageManager, config, @applicationDelegate}) ->
     @emitter = new Emitter
-    @buffers ?= []
+    @buffers = []
+    @rootDirectories = []
+    @repositories = []
+    @directoryProviders = []
+    @defaultDirectoryProvider = new DefaultDirectoryProvider()
+    @repositoryPromisesByPath = new Map()
+    @repositoryProviders = [new GitRepositoryProvider(this, config)]
+    @loadPromisesByPath = {}
+    @watcherPromisesByPath = {}
+    @retiredBufferIDs = new Set()
+    @retiredBufferPaths = new Set()
+    @consumeServices(packageManager)
+
+  destroyed: ->
+    buffer.destroy() for buffer in @buffers.slice()
+    repository?.destroy() for repository in @repositories.slice()
+    watcher.dispose() for _, watcher in @watcherPromisesByPath
     @rootDirectories = []
     @repositories = []
 
-    @directoryProviders = [new DefaultDirectoryProvider()]
-    atom.packages.serviceHub.consume(
-      'atom.directory-provider',
-      '^0.1.0',
-      # New providers are added to the front of @directoryProviders because
-      # DefaultDirectoryProvider is a catch-all that will always provide a Directory.
-      (provider) => @directoryProviders.unshift(provider))
+  reset: (packageManager) ->
+    @emitter.dispose()
+    @emitter = new Emitter
 
-    # Mapping from the real path of a {Directory} to a {Promise} that resolves
-    # to either a {Repository} or null. Ideally, the {Directory} would be used
-    # as the key; however, there can be multiple {Directory} objects created for
-    # the same real path, so it is not a good key.
-    @repositoryPromisesByPath = new Map()
-
-    # Note that the GitRepositoryProvider is registered synchronously so that
-    # it is available immediately on startup.
-    @repositoryProviders = [new GitRepositoryProvider(this)]
-    atom.packages.serviceHub.consume(
-      'atom.repository-provider',
-      '^0.1.0',
-      (provider) =>
-        @repositoryProviders.push(provider)
-
-        # If a path in getPaths() does not have a corresponding Repository, try
-        # to assign one by running through setPaths() again now that
-        # @repositoryProviders has been updated.
-        if null in @repositories
-          @setPaths(@getPaths())
-      )
-
-    @subscribeToBuffer(buffer) for buffer in @buffers
-
-    if Grim.includeDeprecatedAPIs and path?
-      Grim.deprecate("Pass 'paths' array instead of 'path' to project constructor")
-
-    paths ?= _.compact([path])
-    @setPaths(paths)
-
-  destroyed: ->
-    buffer.destroy() for buffer in @getBuffers()
+    buffer?.destroy() for buffer in @buffers
+    @buffers = []
     @setPaths([])
+    @loadPromisesByPath = {}
+    @retiredBufferIDs = new Set()
+    @retiredBufferPaths = new Set()
+    @consumeServices(packageManager)
 
   destroyUnretainedBuffers: ->
     buffer.destroy() for buffer in @getBuffers() when not buffer.isRetained()
@@ -84,22 +61,38 @@ class Project extends Model
   Section: Serialization
   ###
 
-  serializeParams: ->
+  deserialize: (state) ->
+    @retiredBufferIDs = new Set()
+    @retiredBufferPaths = new Set()
+
+    handleBufferState = (bufferState) =>
+      bufferState.shouldDestroyOnFileDelete ?= -> atom.config.get('core.closeDeletedFileTabs')
+
+      # Use a little guilty knowledge of the way TextBuffers are serialized.
+      # This allows TextBuffers that have never been saved (but have filePaths) to be deserialized, but prevents
+      # TextBuffers backed by files that have been deleted from being saved.
+      bufferState.mustExist = bufferState.digestWhenLastPersisted isnt false
+
+      TextBuffer.deserialize(bufferState).catch (err) =>
+        @retiredBufferIDs.add(bufferState.id)
+        @retiredBufferPaths.add(bufferState.filePath)
+        null
+
+    bufferPromises = (handleBufferState(bufferState) for bufferState in state.buffers)
+
+    Promise.all(bufferPromises).then (buffers) =>
+      @buffers = buffers.filter(Boolean)
+      @subscribeToBuffer(buffer) for buffer in @buffers
+      @setPaths(state.paths or [], mustExist: true, exact: true)
+
+  serialize: (options={}) ->
+    deserializer: 'Project'
     paths: @getPaths()
-    buffers: _.compact(@buffers.map (buffer) -> buffer.serialize() if buffer.isRetained())
-
-  deserializeParams: (params) ->
-    params.buffers = _.compact params.buffers.map (bufferState) ->
-      # Check that buffer's file path is accessible
-      return if fs.isDirectorySync(bufferState.filePath)
-      if bufferState.filePath
-        try
-          fs.closeSync(fs.openSync(bufferState.filePath, 'r'))
-        catch error
-          return unless error.code is 'ENOENT'
-
-      atom.deserializers.deserialize(bufferState)
-    params
+    buffers: _.compact(@buffers.map (buffer) ->
+      if buffer.isRetained()
+        isUnloading = options.isUnloading is true
+        buffer.serialize({markerLayers: isUnloading, history: isUnloading})
+    )
 
   ###
   Section: Event Subscription
@@ -114,8 +107,67 @@ class Project extends Model
   onDidChangePaths: (callback) ->
     @emitter.on 'did-change-paths', callback
 
+  # Public: Invoke the given callback when a text buffer is added to the
+  # project.
+  #
+  # * `callback` {Function} to be called when a text buffer is added.
+  #   * `buffer` A {TextBuffer} item.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   onDidAddBuffer: (callback) ->
     @emitter.on 'did-add-buffer', callback
+
+  # Public: Invoke the given callback with all current and future text
+  # buffers in the project.
+  #
+  # * `callback` {Function} to be called with current and future text buffers.
+  #   * `buffer` A {TextBuffer} item.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  observeBuffers: (callback) ->
+    callback(buffer) for buffer in @getBuffers()
+    @onDidAddBuffer callback
+
+  # Extended: Invoke a callback when a filesystem change occurs within any open
+  # project path.
+  #
+  # ```js
+  # const disposable = atom.project.onDidChangeFiles(events => {
+  #   for (const event of events) {
+  #     // "created", "modified", "deleted", or "renamed"
+  #     console.log(`Event action: ${event.type}`)
+  #
+  #     // absolute path to the filesystem entry that was touched
+  #     console.log(`Event path: ${event.path}`)
+  #
+  #     if (event.type === 'renamed') {
+  #       console.log(`.. renamed from: ${event.oldPath}`)
+  #     }
+  #   }
+  # }
+  #
+  # disposable.dispose()
+  # ```
+  #
+  # To watch paths outside of open projects, use the `watchPaths` function instead; see {PathWatcher}.
+  #
+  # When writing tests against functionality that uses this method, be sure to wait for the
+  # {Promise} returned by {getWatcherPromise()} before manipulating the filesystem to ensure that
+  # the watcher is receiving events.
+  #
+  # * `callback` {Function} to be called with batches of filesystem events reported by
+  #   the operating system.
+  #    * `events` An {Array} of objects that describe a batch of filesystem events.
+  #     * `action` {String} describing the filesystem action that occurred. One of `"created"`,
+  #       `"modified"`, `"deleted"`, or `"renamed"`.
+  #     * `path` {String} containing the absolute path to the filesystem entry
+  #       that was acted upon.
+  #     * `oldPath` For rename events, {String} containing the filesystem entry's
+  #       former absolute path.
+  #
+  # Returns a {Disposable} to manage this event subscription.
+  onDidChangeFiles: (callback) ->
+    @emitter.on 'did-change-files', callback
 
   ###
   Section: Accessing the git repository
@@ -128,8 +180,8 @@ class Project extends Model
   # Prefer the following, which evaluates to a {Promise} that resolves to an
   # {Array} of {Repository} objects:
   # ```
-  # Promise.all(project.getDirectories().map(
-  #     project.repositoryForDirectory.bind(project)))
+  # Promise.all(atom.project.getDirectories().map(
+  #     atom.project.repositoryForDirectory.bind(atom.project)))
   # ```
   getRepositories: -> @repositories
 
@@ -154,6 +206,7 @@ class Project extends Model
         # registered in the future that could supply a Repository for the
         # directory.
         @repositoryPromisesByPath.delete(pathForDirectory) unless repo?
+        repo?.onDidDestroy?(=> @repositoryPromisesByPath.delete(pathForDirectory))
         repo
       @repositoryPromisesByPath.set(pathForDirectory, promise)
     promise
@@ -169,45 +222,102 @@ class Project extends Model
   # Public: Set the paths of the project's directories.
   #
   # * `projectPaths` {Array} of {String} paths.
-  setPaths: (projectPaths) ->
-    if includeDeprecatedAPIs
-      rootDirectory.off() for rootDirectory in @rootDirectories
-
+  # * `options` An optional {Object} that may contain the following keys:
+  #   * `mustExist` If `true`, throw an Error if any `projectPaths` do not exist. Any remaining `projectPaths` that
+  #     do exist will still be added to the project. Default: `false`.
+  #   * `exact` If `true`, only add a `projectPath` if it names an existing directory. If `false` and any `projectPath`
+  #     is a file or does not exist, its parent directory will be added instead. Default: `false`.
+  setPaths: (projectPaths, options = {}) ->
     repository?.destroy() for repository in @repositories
     @rootDirectories = []
     @repositories = []
 
-    @addPath(projectPath, emitEvent: false) for projectPath in projectPaths
+    watcher.then((w) -> w.dispose()) for _, watcher in @watcherPromisesByPath
+    @watcherPromisesByPath = {}
 
-    @emit "path-changed" if includeDeprecatedAPIs
+    missingProjectPaths = []
+    for projectPath in projectPaths
+      try
+        @addPath projectPath, emitEvent: false, mustExist: true, exact: options.exact is true
+      catch e
+        if e.missingProjectPaths?
+          missingProjectPaths.push e.missingProjectPaths...
+        else
+          throw e
+
     @emitter.emit 'did-change-paths', projectPaths
+
+    if options.mustExist is true and missingProjectPaths.length > 0
+      err = new Error "One or more project directories do not exist"
+      err.missingProjectPaths = missingProjectPaths
+      throw err
 
   # Public: Add a path to the project's list of root paths
   #
   # * `projectPath` {String} The path to the directory to add.
-  addPath: (projectPath, options) ->
-    for directory in @getDirectories()
-      # Apparently a Directory does not believe it can contain itself, so we
-      # must also check whether the paths match.
-      return if directory.contains(projectPath) or directory.getPath() is projectPath
+  # * `options` An optional {Object} that may contain the following keys:
+  #   * `mustExist` If `true`, throw an Error if the `projectPath` does not exist. If `false`, a `projectPath` that does
+  #     not exist is ignored. Default: `false`.
+  #   * `exact` If `true`, only add `projectPath` if it names an existing directory. If `false`, if `projectPath` is a
+  #     a file or does not exist, its parent directory will be added instead.
+  addPath: (projectPath, options = {}) ->
+    directory = @getDirectoryForProjectPath(projectPath)
 
-    directory = null
-    for provider in @directoryProviders
-      break if directory = provider.directoryForURISync?(projectPath)
-    if directory is null
-      # This should never happen because DefaultDirectoryProvider should always
-      # return a Directory.
-      throw new Error(projectPath + ' could not be resolved to a directory')
+    ok = true
+    ok = ok and directory.getPath() is projectPath if options.exact is true
+    ok = ok and directory.existsSync()
+
+    unless ok
+      if options.mustExist is true
+        err = new Error "Project directory #{directory} does not exist"
+        err.missingProjectPaths = [projectPath]
+        throw err
+      else
+        return
+
+    for existingDirectory in @getDirectories()
+      return if existingDirectory.getPath() is directory.getPath()
+
     @rootDirectories.push(directory)
+    @watcherPromisesByPath[directory.getPath()] = watchPath directory.getPath(), {}, (events) =>
+      # Stop event delivery immediately on removal of a rootDirectory, even if its watcher
+      # promise has yet to resolve at the time of removal
+      if @rootDirectories.includes directory
+        @emitter.emit 'did-change-files', events
+
+    for root, watcherPromise in @watcherPromisesByPath
+      unless @rootDirectories.includes root
+        watcherPromise.then (watcher) -> watcher.dispose()
 
     repo = null
     for provider in @repositoryProviders
       break if repo = provider.repositoryForDirectorySync?(directory)
     @repositories.push(repo ? null)
 
-    unless options?.emitEvent is false
-      @emit "path-changed" if includeDeprecatedAPIs
+    unless options.emitEvent is false
       @emitter.emit 'did-change-paths', @getPaths()
+
+  getDirectoryForProjectPath: (projectPath) ->
+    directory = null
+    for provider in @directoryProviders
+      break if directory = provider.directoryForURISync?(projectPath)
+    directory ?= @defaultDirectoryProvider.directoryForURISync(projectPath)
+    directory
+
+  # Extended: Access a {Promise} that resolves when the filesystem watcher associated with a project
+  # root directory is ready to begin receiving events.
+  #
+  # This is especially useful in test cases, where it's important to know that the watcher is
+  # ready before manipulating the filesystem to produce events.
+  #
+  # * `projectPath` {String} One of the project's root directories.
+  #
+  # Returns a {Promise} that resolves with the {PathWatcher} associated with this project root
+  # once it has initialized and is ready to start sending events. The Promise will reject with
+  # an error instead if `projectPath` is not currently a root directory.
+  getWatcherPromise: (projectPath) ->
+    @watcherPromisesByPath[projectPath] or
+      Promise.reject(new Error("#{projectPath} is not a project root"))
 
   # Public: remove a path from the project's list of root paths.
   #
@@ -215,7 +325,7 @@ class Project extends Model
   removePath: (projectPath) ->
     # The projectPath may be a URI, in which case it should not be normalized.
     unless projectPath in @getPaths()
-      projectPath = path.normalize(projectPath)
+      projectPath = @defaultDirectoryProvider.normalizePath(projectPath)
 
     indexToRemove = null
     for directory, i in @rootDirectories
@@ -226,9 +336,9 @@ class Project extends Model
     if indexToRemove?
       [removedDirectory] = @rootDirectories.splice(indexToRemove, 1)
       [removedRepository] = @repositories.splice(indexToRemove, 1)
-      removedDirectory.off() if includeDeprecatedAPIs
       removedRepository?.destroy() unless removedRepository in @repositories
-      @emit "path-changed" if includeDeprecatedAPIs
+      @watcherPromisesByPath[projectPath]?.then (w) -> w.dispose()
+      delete @watcherPromisesByPath[projectPath]
       @emitter.emit "did-change-paths", @getPaths()
       true
     else
@@ -245,11 +355,10 @@ class Project extends Model
       uri
     else
       if fs.isAbsolute(uri)
-        path.normalize(fs.absolute(uri))
-
+        @defaultDirectoryProvider.normalizePath(fs.resolveHome(uri))
       # TODO: what should we do here when there are multiple directories?
       else if projectPath = @getPaths()[0]
-        path.normalize(fs.absolute(path.join(projectPath, uri)))
+        @defaultDirectoryProvider.normalizePath(fs.resolveHome(path.join(projectPath, uri)))
       else
         undefined
 
@@ -267,10 +376,13 @@ class Project extends Model
   # * `relativePath` {String} The relative path from the project directory to
   #   the given path.
   relativizePath: (fullPath) ->
-    for rootDirectory in @rootDirectories
-      relativePath = rootDirectory.relativize(fullPath)
-      return [rootDirectory.getPath(), relativePath] unless relativePath is fullPath
-    [null, fullPath]
+    result = [null, fullPath]
+    if fullPath?
+      for rootDirectory in @rootDirectories
+        relativePath = rootDirectory.relativize(fullPath)
+        if relativePath?.length < result[1].length
+          result = [rootDirectory.getPath(), relativePath]
+    result
 
   # Public: Determines whether the given path (real or symbolic) is inside the
   # project's directory.
@@ -306,25 +418,25 @@ class Project extends Model
   Section: Private
   ###
 
-  # Given a path to a file, this constructs and associates a new
-  # {TextEditor}, showing the file.
-  #
-  # * `filePath` The {String} path of the file to associate with.
-  # * `options` Options that you can pass to the {TextEditor} constructor.
-  #
-  # Returns a promise that resolves to an {TextEditor}.
-  open: (filePath, options={}) ->
-    filePath = @resolvePath(filePath)
+  consumeServices: ({serviceHub}) ->
+    serviceHub.consume(
+      'atom.directory-provider',
+      '^0.1.0',
+      (provider) =>
+        @directoryProviders.unshift(provider)
+        new Disposable =>
+          @directoryProviders.splice(@directoryProviders.indexOf(provider), 1)
+    )
 
-    if filePath?
-      try
-        fs.closeSync(fs.openSync(filePath, 'r'))
-      catch error
-        # allow ENOENT errors to create an editor for paths that dont exist
-        throw error unless error.code is 'ENOENT'
-
-    @bufferForPath(filePath).then (buffer) =>
-      @buildEditorForBuffer(buffer, options)
+    serviceHub.consume(
+      'atom.repository-provider',
+      '^0.1.0',
+      (provider) =>
+        @repositoryProviders.unshift(provider)
+        @setPaths(@getPaths()) if null in @repositories
+        new Disposable =>
+          @repositoryProviders.splice(@repositoryProviders.indexOf(provider), 1)
+    )
 
   # Retrieves all the {TextBuffer}s in the project; that is, the
   # buffers for all open files.
@@ -340,11 +452,21 @@ class Project extends Model
   findBufferForPath: (filePath) ->
     _.find @buffers, (buffer) -> buffer.getPath() is filePath
 
+  findBufferForId: (id) ->
+    _.find @buffers, (buffer) -> buffer.getId() is id
+
   # Only to be used in specs
   bufferForPathSync: (filePath) ->
     absoluteFilePath = @resolvePath(filePath)
+    return null if @retiredBufferPaths.has absoluteFilePath
     existingBuffer = @findBufferForPath(absoluteFilePath) if filePath
     existingBuffer ? @buildBufferSync(absoluteFilePath)
+
+  # Only to be used when deserializing
+  bufferForIdSync: (id) ->
+    return null if @retiredBufferIDs.has id
+    existingBuffer = @findBufferForId(id) if id
+    existingBuffer ? @buildBufferSync()
 
   # Given a file path, this retrieves or creates a new {TextBuffer}.
   #
@@ -353,20 +475,25 @@ class Project extends Model
   #
   # * `filePath` A {String} representing a path. If `null`, an "Untitled" buffer is created.
   #
-  # Returns a promise that resolves to the {TextBuffer}.
-  bufferForPath: (filePath) ->
-    absoluteFilePath = @resolvePath(filePath)
-    existingBuffer = @findBufferForPath(absoluteFilePath) if absoluteFilePath
-    Q(existingBuffer ? @buildBuffer(absoluteFilePath))
+  # Returns a {Promise} that resolves to the {TextBuffer}.
+  bufferForPath: (absoluteFilePath) ->
+    existingBuffer = @findBufferForPath(absoluteFilePath) if absoluteFilePath?
+    if existingBuffer
+      Promise.resolve(existingBuffer)
+    else
+      @buildBuffer(absoluteFilePath)
 
-  bufferForId: (id) ->
-    _.find @buffers, (buffer) -> buffer.id is id
+  shouldDestroyBufferOnFileDelete: ->
+    atom.config.get('core.closeDeletedFileTabs')
 
   # Still needed when deserializing a tokenized buffer
   buildBufferSync: (absoluteFilePath) ->
-    buffer = new TextBuffer({filePath: absoluteFilePath})
+    params = {shouldDestroyOnFileDelete: @shouldDestroyBufferOnFileDelete}
+    if absoluteFilePath?
+      buffer = TextBuffer.loadSync(absoluteFilePath, params)
+    else
+      buffer = new TextBuffer(params)
     @addBuffer(buffer)
-    buffer.loadSync()
     buffer
 
   # Given a file path, this sets its {TextBuffer}.
@@ -374,27 +501,29 @@ class Project extends Model
   # * `absoluteFilePath` A {String} representing a path.
   # * `text` The {String} text to use as a buffer.
   #
-  # Returns a promise that resolves to the {TextBuffer}.
+  # Returns a {Promise} that resolves to the {TextBuffer}.
   buildBuffer: (absoluteFilePath) ->
-    if fs.getSizeSync(absoluteFilePath) >= 2 * 1048576 # 2MB
-      error = new Error("Atom can only handle files < 2MB for now.")
-      error.code = 'EFILETOOLARGE'
-      throw error
+    params = {shouldDestroyOnFileDelete: @shouldDestroyBufferOnFileDelete}
+    if absoluteFilePath?
+      promise =
+        @loadPromisesByPath[absoluteFilePath] ?=
+        TextBuffer.load(absoluteFilePath, params).catch (error) =>
+          delete @loadPromisesByPath[absoluteFilePath]
+          throw error
+    else
+      promise = Promise.resolve(new TextBuffer(params))
+    promise.then (buffer) =>
+      delete @loadPromisesByPath[absoluteFilePath]
+      @addBuffer(buffer)
+      buffer
 
-    buffer = new TextBuffer({filePath: absoluteFilePath})
-    @addBuffer(buffer)
-    buffer.load()
-      .then((buffer) -> buffer)
-      .catch(=> @removeBuffer(buffer))
 
   addBuffer: (buffer, options={}) ->
     @addBufferAtIndex(buffer, @buffers.length, options)
-    @subscribeToBuffer(buffer)
 
   addBufferAtIndex: (buffer, index, options={}) ->
     @buffers.splice(index, 0, buffer)
     @subscribeToBuffer(buffer)
-    @emit 'buffer-created', buffer if includeDeprecatedAPIs
     @emitter.emit 'did-add-buffer', buffer
     buffer
 
@@ -409,10 +538,6 @@ class Project extends Model
     [buffer] = @buffers.splice(index, 1)
     buffer?.destroy()
 
-  buildEditorForBuffer: (buffer, editorOptions) ->
-    editor = new TextEditor(_.extend({buffer, registerEditor: true}, editorOptions))
-    editor
-
   eachBuffer: (args...) ->
     subscriber = args.shift() if args.length > 1
     callback = args.shift()
@@ -424,75 +549,17 @@ class Project extends Model
       @on 'buffer-created', (buffer) -> callback(buffer)
 
   subscribeToBuffer: (buffer) ->
+    buffer.onWillSave ({path}) => @applicationDelegate.emitWillSavePath(path)
+    buffer.onDidSave ({path}) => @applicationDelegate.emitDidSavePath(path)
     buffer.onDidDestroy => @removeBuffer(buffer)
-    buffer.onWillThrowWatchError ({error, handle}) ->
+    buffer.onDidChangePath =>
+      unless @getPaths().length > 0
+        @setPaths([path.dirname(buffer.getPath())])
+    buffer.onWillThrowWatchError ({error, handle}) =>
       handle()
-      atom.notifications.addWarning """
+      @notificationManager.addWarning """
         Unable to read file after file `#{error.eventType}` event.
         Make sure you have permission to access `#{buffer.getPath()}`.
         """,
         detail: error.message
         dismissable: true
-
-if includeDeprecatedAPIs
-  Project.pathForRepositoryUrl = (repoUrl) ->
-    deprecate '::pathForRepositoryUrl will be removed. Please remove from your code.'
-    [repoName] = url.parse(repoUrl).path.split('/')[-1..]
-    repoName = repoName.replace(/\.git$/, '')
-    path.join(atom.config.get('core.projectHome'), repoName)
-
-  Project::registerOpener = (opener) ->
-    deprecate("Use Workspace::addOpener instead")
-    atom.workspace.addOpener(opener)
-
-  Project::unregisterOpener = (opener) ->
-    deprecate("Call .dispose() on the Disposable returned from ::addOpener instead")
-    atom.workspace.unregisterOpener(opener)
-
-  Project::eachEditor = (callback) ->
-    deprecate("Use Workspace::observeTextEditors instead")
-    atom.workspace.observeTextEditors(callback)
-
-  Project::getEditors = ->
-    deprecate("Use Workspace::getTextEditors instead")
-    atom.workspace.getTextEditors()
-
-  Project::on = (eventName) ->
-    if eventName is 'path-changed'
-      Grim.deprecate("Use Project::onDidChangePaths instead")
-    else
-      Grim.deprecate("Project::on is deprecated. Use documented event subscription methods instead.")
-    super
-
-  Project::getRepo = ->
-    Grim.deprecate("Use ::getRepositories instead")
-    @getRepositories()[0]
-
-  Project::getPath = ->
-    Grim.deprecate("Use ::getPaths instead")
-    @getPaths()[0]
-
-  Project::setPath = (path) ->
-    Grim.deprecate("Use ::setPaths instead")
-    @setPaths([path])
-
-  Project::getRootDirectory = ->
-    Grim.deprecate("Use ::getDirectories instead")
-    @getDirectories()[0]
-
-  Project::resolve = (uri) ->
-    Grim.deprecate("Use `Project::getDirectories()[0]?.resolve()` instead")
-    @resolvePath(uri)
-
-  Project::scan = (regex, options={}, iterator) ->
-    Grim.deprecate("Use atom.workspace.scan instead of atom.project.scan")
-    atom.workspace.scan(regex, options, iterator)
-
-  Project::replace = (regex, replacementText, filePaths, iterator) ->
-    Grim.deprecate("Use atom.workspace.replace instead of atom.project.replace")
-    atom.workspace.replace(regex, replacementText, filePaths, iterator)
-
-  Project::openSync = (filePath, options={}) ->
-    deprecate("Use Project::open instead")
-    filePath = @resolvePath(filePath)
-    @buildEditorForBuffer(@bufferForPathSync(filePath), options)

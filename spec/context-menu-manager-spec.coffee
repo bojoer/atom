@@ -1,5 +1,3 @@
-{$$} = require '../src/space-pen-extensions'
-
 ContextMenuManager = require '../src/context-menu-manager'
 
 describe "ContextMenuManager", ->
@@ -7,16 +5,27 @@ describe "ContextMenuManager", ->
 
   beforeEach ->
     {resourcePath} = atom.getLoadSettings()
-    contextMenu = new ContextMenuManager({resourcePath})
+    contextMenu = new ContextMenuManager({keymapManager: atom.keymaps})
+    contextMenu.initialize({resourcePath})
 
     parent = document.createElement("div")
     child = document.createElement("div")
     grandchild = document.createElement("div")
+    parent.tabIndex = -1
+    child.tabIndex = -1
+    grandchild.tabIndex = -1
     parent.classList.add('parent')
     child.classList.add('child')
     grandchild.classList.add('grandchild')
     child.appendChild(grandchild)
     parent.appendChild(child)
+
+    document.body.appendChild(parent)
+
+  afterEach ->
+    document.body.blur()
+    document.body.removeChild(parent)
+
 
   describe "::add(itemsBySelector)", ->
     it "can add top-level menu items that can be removed with the returned disposable", ->
@@ -151,6 +160,55 @@ describe "ContextMenuManager", ->
       shouldDisplay = false
       expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual []
 
+    it "prunes a trailing separator", ->
+      contextMenu.add
+        '.grandchild': [
+          {label: 'A', command: 'a'},
+          {type: 'separator'},
+          {label: 'B', command: 'b'},
+          {type: 'separator'}
+        ]
+
+      expect(contextMenu.templateForEvent({target: grandchild}).length).toBe(3)
+
+    it "prunes a leading separator", ->
+      contextMenu.add
+        '.grandchild': [
+          {type: 'separator'},
+          {label: 'A', command: 'a'},
+          {type: 'separator'},
+          {label: 'B', command: 'b'}
+        ]
+
+      expect(contextMenu.templateForEvent({target: grandchild}).length).toBe(3)
+
+    it "prunes duplicate separators", ->
+      contextMenu.add
+        '.grandchild': [
+          {label: 'A', command: 'a'},
+          {type: 'separator'},
+          {type: 'separator'},
+          {label: 'B', command: 'b'}
+        ]
+
+      expect(contextMenu.templateForEvent({target: grandchild}).length).toBe(3)
+
+    it "prunes all redundant separators", ->
+      contextMenu.add
+        '.grandchild': [
+          {type: 'separator'},
+          {type: 'separator'},
+          {label: 'A', command: 'a'},
+          {type: 'separator'},
+          {type: 'separator'},
+          {label: 'B', command: 'b'}
+          {label: 'C', command: 'c'}
+          {type: 'separator'},
+          {type: 'separator'},
+        ]
+
+      expect(contextMenu.templateForEvent({target: grandchild}).length).toBe(4)
+
     it "throws an error when the selector is invalid", ->
       addError = null
       try
@@ -159,31 +217,119 @@ describe "ContextMenuManager", ->
         addError = error
       expect(addError.message).toContain('<>')
 
-    describe "when the menus are specified in a legacy format", ->
-      beforeEach ->
-        jasmine.snapshotDeprecations()
-
-      afterEach ->
-        jasmine.restoreDeprecationsSnapshot()
-
-      it "allows items to be specified in the legacy format for now", ->
-        contextMenu.add '.parent':
-          'A': 'a'
-          'Separator 1': '-'
-          'B':
-            'C': 'c'
-            'Separator 2': '-'
-            'D': 'd'
-
-        expect(contextMenu.templateForElement(parent)).toEqual [
-          {label: 'A', command: 'a'}
-          {type: 'separator'}
+    it "calls `created` hooks for submenu items", ->
+      item = {
+        label: 'A',
+        command: 'B',
+        submenu: [
           {
-            label: 'B'
-            submenu: [
-              {label: 'C', command: 'c'}
-              {type: 'separator'}
-              {label: 'D', command: 'd'}
-            ]
+            label: 'C',
+            created: (event) -> @label = 'D',
           }
         ]
+      }
+      contextMenu.add('.grandchild': [item])
+
+      dispatchedEvent = {target: grandchild}
+      expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual(
+        [
+          label: 'A',
+          command: 'B',
+          submenu: [
+            {
+              label: 'D',
+            }
+          ]
+        ])
+
+  describe "::templateForEvent(target)", ->
+    [keymaps, item] = []
+
+    beforeEach ->
+      keymaps = atom.keymaps.add('source', {
+        '.child': {
+          'ctrl-a': 'test:my-command',
+          'shift-b': 'test:my-other-command'
+        }
+      })
+      item = {
+        label: 'My Command',
+        command: 'test:my-command',
+        submenu: [
+          {
+            label: 'My Other Command',
+            command: 'test:my-other-command',
+          }
+        ]
+      }
+      contextMenu.add('.parent': [item])
+
+    afterEach ->
+      keymaps.dispose()
+
+
+    it "adds Electron-style accelerators to items that have keybindings", ->
+      child.focus()
+      dispatchedEvent = {target: child}
+      expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual(
+        [
+          label: 'My Command',
+          command: 'test:my-command',
+          accelerator: 'Ctrl+A',
+          submenu: [
+            {
+              label: 'My Other Command',
+              command: 'test:my-other-command',
+              accelerator: 'Shift+B',
+            }
+          ]
+        ])
+
+    it "adds accelerators when a parent node has key bindings for a given command", ->
+      grandchild.focus()
+      dispatchedEvent = {target: grandchild}
+      expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual(
+        [
+          label: 'My Command',
+          command: 'test:my-command',
+          accelerator: 'Ctrl+A',
+          submenu: [
+            {
+              label: 'My Other Command',
+              command: 'test:my-other-command',
+              accelerator: 'Shift+B',
+            }
+          ]
+        ])
+
+    it "does not add accelerators when a child node has key bindings for a given command", ->
+      parent.focus()
+      dispatchedEvent = {target: parent}
+      expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual(
+        [
+          label: 'My Command',
+          command: 'test:my-command',
+          submenu: [
+            {
+              label: 'My Other Command',
+              command: 'test:my-other-command',
+            }
+          ]
+        ])
+
+    it "adds accelerators based on focus, not context menu target", ->
+      grandchild.focus()
+      dispatchedEvent = {target: parent}
+      expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual(
+        [
+          label: 'My Command',
+          command: 'test:my-command',
+          accelerator: 'Ctrl+A',
+          submenu: [
+            {
+              label: 'My Other Command',
+              command: 'test:my-other-command',
+              accelerator: 'Shift+B',
+            }
+          ]
+        ])

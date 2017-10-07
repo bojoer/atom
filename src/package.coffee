@@ -5,48 +5,16 @@ async = require 'async'
 CSON = require 'season'
 fs = require 'fs-plus'
 {Emitter, CompositeDisposable} = require 'event-kit'
-Q = require 'q'
-{includeDeprecatedAPIs, deprecate} = require 'grim'
 
+CompileCache = require './compile-cache'
 ModuleCache = require './module-cache'
 ScopedProperties = require './scoped-properties'
+BufferedProcess = require './buffered-process'
 
-packagesCache = require('../package.json')?._atomPackages ? {}
-
-# Loads and activates a package's main module and resources such as
+# Extended: Loads and activates a package's main module and resources such as
 # stylesheets, keymaps, grammar, editor properties, and menus.
 module.exports =
 class Package
-  @isBundledPackagePath: (packagePath) ->
-    if atom.packages.devMode
-      return false unless atom.packages.resourcePath.startsWith("#{process.resourcesPath}#{path.sep}")
-
-    @resourcePathWithTrailingSlash ?= "#{atom.packages.resourcePath}#{path.sep}"
-    packagePath?.startsWith(@resourcePathWithTrailingSlash)
-
-  @loadMetadata: (packagePath, ignoreErrors=false) ->
-    packageName = path.basename(packagePath)
-    if @isBundledPackagePath(packagePath)
-      metadata = packagesCache[packageName]?.metadata
-    unless metadata?
-      if metadataPath = CSON.resolve(path.join(packagePath, 'package'))
-        try
-          metadata = CSON.readFileSync(metadataPath)
-        catch error
-          throw error unless ignoreErrors
-    metadata ?= {}
-    metadata.name = packageName
-
-    if includeDeprecatedAPIs and metadata.stylesheetMain?
-      deprecate("Use the `mainStyleSheet` key instead of `stylesheetMain` in the `package.json` of `#{packageName}`", {packageName})
-      metadata.mainStyleSheet = metadata.stylesheetMain
-
-    if includeDeprecatedAPIs and metadata.stylesheets?
-      deprecate("Use the `styleSheets` key instead of `stylesheets` in the `package.json` of `#{packageName}`", {packageName})
-      metadata.styleSheets = metadata.stylesheets
-
-    metadata
-
   keymaps: null
   menus: null
   stylesheets: null
@@ -56,17 +24,24 @@ class Package
   mainModulePath: null
   resolvedMainModulePath: false
   mainModule: null
+  mainInitialized: false
+  mainActivated: false
 
   ###
   Section: Construction
   ###
 
-  constructor: (@path, @metadata) ->
+  constructor: (params) ->
+    {
+      @path, @metadata, @bundledPackage, @preloadedPackage, @packageManager, @config, @styleManager, @commandRegistry,
+      @keymapManager, @notificationManager, @grammarRegistry, @themeManager,
+      @menuManager, @contextMenuManager, @deserializerManager, @viewRegistry
+    } = params
+
     @emitter = new Emitter
-    @metadata ?= Package.loadMetadata(@path)
-    @bundledPackage = Package.isBundledPackagePath(@path)
-    @name = @metadata?.name ? path.basename(@path)
-    ModuleCache.add(@path, @metadata)
+    @metadata ?= @packageManager.loadPackageMetadata(@path)
+    @bundledPackage ?= @packageManager.isBundledPackagePath(@path)
+    @name = @metadata?.name ? params.name ? path.basename(@path)
     @reset()
 
   ###
@@ -86,10 +61,10 @@ class Package
   ###
 
   enable: ->
-    atom.config.removeAtKeyPath('core.disabledPackages', @name)
+    @config.removeAtKeyPath('core.disabledPackages', @name)
 
   disable: ->
-    atom.config.pushAtKeyPath('core.disabledPackages', @name)
+    @config.pushAtKeyPath('core.disabledPackages', @name)
 
   isTheme: ->
     @metadata?.theme?
@@ -104,17 +79,61 @@ class Package
 
   getStyleSheetPriority: -> 0
 
+  preload: ->
+    @loadKeymaps()
+    @loadMenus()
+    @registerDeserializerMethods()
+    @activateCoreStartupServices()
+    @configSchemaRegisteredOnLoad = @registerConfigSchemaFromMetadata()
+    @requireMainModule()
+    @settingsPromise = @loadSettings()
+
+    @activationDisposables = new CompositeDisposable
+    @activateKeymaps()
+    @activateMenus()
+    settings.activate() for settings in @settings
+    @settingsActivated = true
+
+  finishLoading: ->
+    @measure 'loadTime', =>
+      @path = path.join(@packageManager.resourcePath, @path)
+      ModuleCache.add(@path, @metadata)
+
+      @loadStylesheets()
+      # Unfortunately some packages are accessing `@mainModulePath`, so we need
+      # to compute that variable eagerly also for preloaded packages.
+      @getMainModulePath()
+
   load: ->
     @measure 'loadTime', =>
       try
+        ModuleCache.add(@path, @metadata)
+
         @loadKeymaps()
         @loadMenus()
         @loadStylesheets()
+        @registerDeserializerMethods()
+        @activateCoreStartupServices()
+        @registerTranspilerConfig()
+        @configSchemaRegisteredOnLoad = @registerConfigSchemaFromMetadata()
         @settingsPromise = @loadSettings()
-        @requireMainModule() unless @hasActivationCommands()
+        if @shouldRequireMainModuleOnLoad() and not @mainModule?
+          @requireMainModule()
       catch error
         @handleError("Failed to load the #{@name} package", error)
     this
+
+  unload: ->
+    @unregisterTranspilerConfig()
+
+  shouldRequireMainModuleOnLoad: ->
+    not (
+      @metadata.deserializers? or
+      @metadata.viewProviders? or
+      @metadata.configSchema? or
+      @activationShouldBeDeferred() or
+      localStorage.getItem(@getCanDeferMainModuleRequireStorageKey()) is 'true'
+    )
 
   reset: ->
     @stylesheets = []
@@ -122,51 +141,79 @@ class Package
     @menus = []
     @grammars = []
     @settings = []
+    @mainInitialized = false
+    @mainActivated = false
+
+  initializeIfNeeded: ->
+    return if @mainInitialized
+    @measure 'initializeTime', =>
+      try
+        # The main module's `initialize()` method is guaranteed to be called
+        # before its `activate()`. This gives you a chance to handle the
+        # serialized package state before the package's derserializers and view
+        # providers are used.
+        @requireMainModule() unless @mainModule?
+        @mainModule.initialize?(@packageManager.getPackageState(@name) ? {})
+        @mainInitialized = true
+      catch error
+        @handleError("Failed to initialize the #{@name} package", error)
+    return
 
   activate: ->
     @grammarsPromise ?= @loadGrammars()
+    @activationPromise ?=
+      new Promise (resolve, reject) =>
+        @resolveActivationPromise = resolve
+        @measure 'activateTime', =>
+          try
+            @activateResources()
+            if @activationShouldBeDeferred()
+              @subscribeToDeferredActivation()
+            else
+              @activateNow()
+          catch error
+            @handleError("Failed to activate the #{@name} package", error)
 
-    unless @activationDeferred?
-      @activationDeferred = Q.defer()
-      @measure 'activateTime', =>
-        try
-          @activateResources()
-          if @hasActivationCommands()
-            @subscribeToActivationCommands()
-          else
-            @activateNow()
-        catch error
-          @handleError("Failed to activate the #{@name} package", error)
-
-    Q.all([@grammarsPromise, @settingsPromise, @activationDeferred.promise])
+    Promise.all([@grammarsPromise, @settingsPromise, @activationPromise])
 
   activateNow: ->
     try
-      @activateConfig()
+      @requireMainModule() unless @mainModule?
+      @configSchemaRegisteredOnActivate = @registerConfigSchemaFromMainModule()
+      @registerViewProviders()
       @activateStylesheets()
-      if @requireMainModule()
-        @mainModule.activate?(atom.packages.getPackageState(@name) ? {})
+      if @mainModule? and not @mainActivated
+        @initializeIfNeeded()
+        @mainModule.activateConfig?()
+        @mainModule.activate?(@packageManager.getPackageState(@name) ? {})
         @mainActivated = true
         @activateServices()
+      @activationCommandSubscriptions?.dispose()
+      @activationHookSubscriptions?.dispose()
     catch error
       @handleError("Failed to activate the #{@name} package", error)
 
-    @activationDeferred?.resolve()
+    @resolveActivationPromise?()
 
-  activateConfig: ->
-    return if @configActivated
+  registerConfigSchemaFromMetadata: ->
+    if configSchema = @metadata.configSchema
+      @config.setSchema @name, {type: 'object', properties: configSchema}
+      true
+    else
+      false
 
-    @requireMainModule()
-    if @mainModule?
+  registerConfigSchemaFromMainModule: ->
+    if @mainModule? and not @configSchemaRegisteredOnLoad
       if @mainModule.config? and typeof @mainModule.config is 'object'
-        atom.config.setSchema @name, {type: 'object', properties: @mainModule.config}
-      else if includeDeprecatedAPIs and @mainModule.configDefaults? and typeof @mainModule.configDefaults is 'object'
-        deprecate """Use a config schema instead. See the configuration section
-        of https://atom.io/docs/latest/hacking-atom-package-word-count and
-        https://atom.io/docs/api/latest/Config for more details"""
-        atom.config.setDefaults(@name, @mainModule.configDefaults)
-      @mainModule.activateConfig?()
-    @configActivated = true
+        @config.setSchema @name, {type: 'object', properties: @mainModule.config}
+        return true
+    false
+
+  # TODO: Remove. Settings view calls this method currently.
+  activateConfig: ->
+    return if @configSchemaRegisteredOnLoad
+    @requireMainModule()
+    @registerConfigSchemaFromMainModule()
 
   activateStylesheets: ->
     return if @stylesheetsActivated
@@ -182,30 +229,80 @@ class Package
       else
         context = undefined
 
-      @stylesheetDisposables.add(atom.styles.addStyleSheet(source, {sourcePath, priority, context}))
+      @stylesheetDisposables.add(
+        @styleManager.addStyleSheet(
+          source,
+          {
+            sourcePath,
+            priority,
+            context,
+            skipDeprecatedSelectorsTransformation: @bundledPackage
+          }
+        )
+      )
     @stylesheetsActivated = true
 
   activateResources: ->
-    @activationDisposables = new CompositeDisposable
-    @activationDisposables.add(atom.keymaps.add(keymapPath, map)) for [keymapPath, map] in @keymaps
+    @activationDisposables ?= new CompositeDisposable
 
+    keymapIsDisabled = _.include(@config.get("core.packagesWithKeymapsDisabled") ? [], @name)
+    if keymapIsDisabled
+      @deactivateKeymaps()
+    else unless @keymapActivated
+      @activateKeymaps()
+
+    unless @menusActivated
+      @activateMenus()
+
+    unless @grammarsActivated
+      grammar.activate() for grammar in @grammars
+      @grammarsActivated = true
+
+    unless @settingsActivated
+      settings.activate() for settings in @settings
+      @settingsActivated = true
+
+  activateKeymaps: ->
+    return if @keymapActivated
+
+    @keymapDisposables = new CompositeDisposable()
+
+    validateSelectors = not @preloadedPackage
+    @keymapDisposables.add(@keymapManager.add(keymapPath, map, 0, validateSelectors)) for [keymapPath, map] in @keymaps
+    @menuManager.update()
+
+    @keymapActivated = true
+
+  deactivateKeymaps: ->
+    return if not @keymapActivated
+
+    @keymapDisposables?.dispose()
+    @menuManager.update()
+
+    @keymapActivated = false
+
+  hasKeymaps: ->
+    for [path, map] in @keymaps
+      if map.length > 0
+        return true
+    false
+
+  activateMenus: ->
+    validateSelectors = not @preloadedPackage
     for [menuPath, map] in @menus when map['context-menu']?
       try
-        @activationDisposables.add(atom.contextMenu.add(map['context-menu']))
+        itemsBySelector = map['context-menu']
+        @activationDisposables.add(@contextMenuManager.add(itemsBySelector, validateSelectors))
       catch error
         if error.code is 'EBADSELECTOR'
           error.message += " in #{menuPath}"
           error.stack += "\n  at #{menuPath}:1:1"
         throw error
 
-    @activationDisposables.add(atom.menu.add(map['menu'])) for [menuPath, map] in @menus when map['menu']?
+    for [menuPath, map] in @menus when map['menu']?
+      @activationDisposables.add(@menuManager.add(map['menu']))
 
-    unless @grammarsActivated
-      grammar.activate() for grammar in @grammars
-      @grammarsActivated = true
-
-    settings.activate() for settings in @settings
-    @settingsActivated = true
+    @menusActivated = true
 
   activateServices: ->
     for name, {versions} of @metadata.providedServices
@@ -213,24 +310,32 @@ class Package
       for version, methodName of versions
         if typeof @mainModule[methodName] is 'function'
           servicesByVersion[version] = @mainModule[methodName]()
-      @activationDisposables.add atom.packages.serviceHub.provide(name, servicesByVersion)
+      @activationDisposables.add @packageManager.serviceHub.provide(name, servicesByVersion)
 
     for name, {versions} of @metadata.consumedServices
       for version, methodName of versions
         if typeof @mainModule[methodName] is 'function'
-          @activationDisposables.add atom.packages.serviceHub.consume(name, version, @mainModule[methodName].bind(@mainModule))
+          @activationDisposables.add @packageManager.serviceHub.consume(name, version, @mainModule[methodName].bind(@mainModule))
     return
 
+  registerTranspilerConfig: ->
+    if @metadata.atomTranspilers
+      CompileCache.addTranspilerConfigForPath(@path, @name, @metadata, @metadata.atomTranspilers)
+
+  unregisterTranspilerConfig: ->
+    if @metadata.atomTranspilers
+      CompileCache.removeTranspilerConfigForPath(@path)
+
   loadKeymaps: ->
-    if @bundledPackage and packagesCache[@name]?
-      @keymaps = (["#{atom.packages.resourcePath}#{path.sep}#{keymapPath}", keymapObject] for keymapPath, keymapObject of packagesCache[@name].keymaps)
+    if @bundledPackage and @packageManager.packagesCache[@name]?
+      @keymaps = (["core:#{keymapPath}", keymapObject] for keymapPath, keymapObject of @packageManager.packagesCache[@name].keymaps)
     else
-      @keymaps = @getKeymapPaths().map (keymapPath) -> [keymapPath, CSON.readFileSync(keymapPath) ? {}]
+      @keymaps = @getKeymapPaths().map (keymapPath) -> [keymapPath, CSON.readFileSync(keymapPath, allowDuplicateKeys: false) ? {}]
     return
 
   loadMenus: ->
-    if @bundledPackage and packagesCache[@name]?
-      @menus = (["#{atom.packages.resourcePath}#{path.sep}#{menuPath}", menuObject] for menuPath, menuObject of packagesCache[@name].menus)
+    if @bundledPackage and @packageManager.packagesCache[@name]?
+      @menus = (["core:#{menuPath}", menuObject] for menuPath, menuObject of @packageManager.packagesCache[@name].menus)
     else
       @menus = @getMenuPaths().map (menuPath) -> [menuPath, CSON.readFileSync(menuPath) ? {}]
     return
@@ -250,36 +355,74 @@ class Package
       fs.listSync(menusDirPath, ['cson', 'json'])
 
   loadStylesheets: ->
-    @stylesheets = @getStylesheetPaths().map (stylesheetPath) ->
-      [stylesheetPath, atom.themes.loadStylesheet(stylesheetPath, true)]
+    @stylesheets = @getStylesheetPaths().map (stylesheetPath) =>
+      [stylesheetPath, @themeManager.loadStylesheet(stylesheetPath, true)]
+
+  registerDeserializerMethods: ->
+    if @metadata.deserializers?
+      Object.keys(@metadata.deserializers).forEach (deserializerName) =>
+        methodName = @metadata.deserializers[deserializerName]
+        @deserializerManager.add
+          name: deserializerName,
+          deserialize: (state, atomEnvironment) =>
+            @registerViewProviders()
+            @requireMainModule()
+            @initializeIfNeeded()
+            @mainModule[methodName](state, atomEnvironment)
+      return
+
+  activateCoreStartupServices: ->
+    if directoryProviderService = @metadata.providedServices?['atom.directory-provider']
+      @requireMainModule()
+      servicesByVersion = {}
+      for version, methodName of directoryProviderService.versions
+        if typeof @mainModule[methodName] is 'function'
+          servicesByVersion[version] = @mainModule[methodName]()
+      @packageManager.serviceHub.provide('atom.directory-provider', servicesByVersion)
+
+  registerViewProviders: ->
+    if @metadata.viewProviders? and not @registeredViewProviders
+      @requireMainModule()
+      @metadata.viewProviders.forEach (methodName) =>
+        @viewRegistry.addViewProvider (model) =>
+          @initializeIfNeeded()
+          @mainModule[methodName](model)
+      @registeredViewProviders = true
 
   getStylesheetsPath: ->
-    if includeDeprecatedAPIs and fs.isDirectorySync(path.join(@path, 'stylesheets'))
-      deprecate("Store package style sheets in the `styles/` directory instead of `stylesheets/` in the `#{@name}` package", packageName: @name)
-      path.join(@path, 'stylesheets')
-    else
-      path.join(@path, 'styles')
+    path.join(@path, 'styles')
 
   getStylesheetPaths: ->
-    stylesheetDirPath = @getStylesheetsPath()
-    if @metadata.mainStyleSheet
-      [fs.resolve(@path, @metadata.mainStyleSheet)]
-    else if @metadata.styleSheets
-      @metadata.styleSheets.map (name) -> fs.resolve(stylesheetDirPath, name, ['css', 'less', ''])
-    else if indexStylesheet = fs.resolve(@path, 'index', ['css', 'less'])
-      [indexStylesheet]
+    if @bundledPackage and @packageManager.packagesCache[@name]?.styleSheetPaths?
+      styleSheetPaths = @packageManager.packagesCache[@name].styleSheetPaths
+      styleSheetPaths.map (styleSheetPath) => path.join(@path, styleSheetPath)
     else
-      fs.listSync(stylesheetDirPath, ['css', 'less'])
+      stylesheetDirPath = @getStylesheetsPath()
+      if @metadata.mainStyleSheet
+        [fs.resolve(@path, @metadata.mainStyleSheet)]
+      else if @metadata.styleSheets
+        @metadata.styleSheets.map (name) -> fs.resolve(stylesheetDirPath, name, ['css', 'less', ''])
+      else if indexStylesheet = fs.resolve(@path, 'index', ['css', 'less'])
+        [indexStylesheet]
+      else
+        fs.listSync(stylesheetDirPath, ['css', 'less'])
 
   loadGrammarsSync: ->
     return if @grammarsLoaded
 
-    grammarsDirPath = path.join(@path, 'grammars')
-    grammarPaths = fs.listSync(grammarsDirPath, ['json', 'cson'])
+    if @preloadedPackage and @packageManager.packagesCache[@name]?
+      grammarPaths = @packageManager.packagesCache[@name].grammarPaths
+    else
+      grammarPaths = fs.listSync(path.join(@path, 'grammars'), ['json', 'cson'])
+
     for grammarPath in grammarPaths
+      if @preloadedPackage and @packageManager.packagesCache[@name]?
+        grammarPath = path.resolve(@packageManager.resourcePath, grammarPath)
+
       try
-        grammar = atom.grammars.readGrammarSync(grammarPath)
+        grammar = @grammarRegistry.readGrammarSync(grammarPath)
         grammar.packageName = @name
+        grammar.bundledPackage = @bundledPackage
         @grammars.push(grammar)
         grammar.activate()
       catch error
@@ -289,57 +432,64 @@ class Package
     @grammarsActivated = true
 
   loadGrammars: ->
-    return Q() if @grammarsLoaded
+    return Promise.resolve() if @grammarsLoaded
 
     loadGrammar = (grammarPath, callback) =>
-      atom.grammars.readGrammar grammarPath, (error, grammar) =>
+      if @preloadedPackage
+        grammarPath = path.resolve(@packageManager.resourcePath, grammarPath)
+
+      @grammarRegistry.readGrammar grammarPath, (error, grammar) =>
         if error?
           detail = "#{error.message} in #{grammarPath}"
           stack = "#{error.stack}\n  at #{grammarPath}:1:1"
-          atom.notifications.addFatalError("Failed to load a #{@name} package grammar", {stack, detail, dismissable: true})
+          @notificationManager.addFatalError("Failed to load a #{@name} package grammar", {stack, detail, packageName: @name, dismissable: true})
         else
           grammar.packageName = @name
+          grammar.bundledPackage = @bundledPackage
           @grammars.push(grammar)
           grammar.activate() if @grammarsActivated
         callback()
 
-    deferred = Q.defer()
-    grammarsDirPath = path.join(@path, 'grammars')
-    fs.exists grammarsDirPath, (grammarsDirExists) ->
-      return deferred.resolve() unless grammarsDirExists
+    new Promise (resolve) =>
+      if @preloadedPackage and @packageManager.packagesCache[@name]?
+        grammarPaths = @packageManager.packagesCache[@name].grammarPaths
+        async.each grammarPaths, loadGrammar, -> resolve()
+      else
+        grammarsDirPath = path.join(@path, 'grammars')
+        fs.exists grammarsDirPath, (grammarsDirExists) ->
+          return resolve() unless grammarsDirExists
 
-      fs.list grammarsDirPath, ['json', 'cson'], (error, grammarPaths=[]) ->
-        async.each grammarPaths, loadGrammar, -> deferred.resolve()
-    deferred.promise
+          fs.list grammarsDirPath, ['json', 'cson'], (error, grammarPaths=[]) ->
+            async.each grammarPaths, loadGrammar, -> resolve()
 
   loadSettings: ->
     @settings = []
 
     loadSettingsFile = (settingsPath, callback) =>
-      ScopedProperties.load settingsPath, (error, settings) =>
+      ScopedProperties.load settingsPath, @config, (error, settings) =>
         if error?
           detail = "#{error.message} in #{settingsPath}"
           stack = "#{error.stack}\n  at #{settingsPath}:1:1"
-          atom.notifications.addFatalError("Failed to load the #{@name} package settings", {stack, detail, dismissable: true})
+          @notificationManager.addFatalError("Failed to load the #{@name} package settings", {stack, detail, packageName: @name, dismissable: true})
         else
           @settings.push(settings)
           settings.activate() if @settingsActivated
         callback()
 
-    deferred = Q.defer()
+    new Promise (resolve) =>
+      if @preloadedPackage and @packageManager.packagesCache[@name]?
+        for settingsPath, scopedProperties of @packageManager.packagesCache[@name].settings
+          settings = new ScopedProperties("core:#{settingsPath}", scopedProperties ? {}, @config)
+          @settings.push(settings)
+          settings.activate() if @settingsActivated
+        resolve()
+      else
+        settingsDirPath = path.join(@path, 'settings')
+        fs.exists settingsDirPath, (settingsDirExists) ->
+          return resolve() unless settingsDirExists
 
-    if includeDeprecatedAPIs and fs.isDirectorySync(path.join(@path, 'scoped-properties'))
-      settingsDirPath = path.join(@path, 'scoped-properties')
-      deprecate("Store package settings files in the `settings/` directory instead of `scoped-properties/`", packageName: @name)
-    else
-      settingsDirPath = path.join(@path, 'settings')
-
-    fs.exists settingsDirPath, (settingsDirExists) ->
-      return deferred.resolve() unless settingsDirExists
-
-      fs.list settingsDirPath, ['json', 'cson'], (error, settingsPaths=[]) ->
-        async.each settingsPaths, loadSettingsFile, -> deferred.resolve()
-    deferred.promise
+          fs.list settingsDirPath, ['json', 'cson'], (error, settingsPaths=[]) ->
+            async.each settingsPaths, loadSettingsFile, -> resolve()
 
   serialize: ->
     if @mainActivated
@@ -349,35 +499,50 @@ class Package
         console.error "Error serializing package '#{@name}'", e.stack
 
   deactivate: ->
-    @activationDeferred?.reject()
-    @activationDeferred = null
+    @activationPromise = null
+    @resolveActivationPromise = null
     @activationCommandSubscriptions?.dispose()
+    @activationHookSubscriptions?.dispose()
+    @configSchemaRegisteredOnActivate = false
     @deactivateResources()
-    @deactivateConfig()
-    if @mainActivated
-      try
-        @mainModule?.deactivate?()
-      catch e
-        console.error "Error deactivating package '#{@name}'", e.stack
-    @emit 'deactivated' if includeDeprecatedAPIs
-    @emitter.emit 'did-deactivate'
+    @deactivateKeymaps()
 
-  deactivateConfig: ->
-    @mainModule?.deactivateConfig?()
-    @configActivated = false
+    unless @mainActivated
+      @emitter.emit 'did-deactivate'
+      return
+
+    try
+      deactivationResult = @mainModule?.deactivate?()
+    catch e
+      console.error "Error deactivating package '#{@name}'", e.stack
+
+    # We support then-able async promises as well as sync ones from deactivate
+    if typeof deactivationResult?.then is 'function'
+      deactivationResult.then => @afterDeactivation()
+    else
+      @afterDeactivation()
+
+  afterDeactivation: ->
+    try
+      @mainModule?.deactivateConfig?()
+    catch e
+      console.error "Error deactivating package '#{@name}'", e.stack
+    @mainActivated = false
+    @mainInitialized = false
+    @emitter.emit 'did-deactivate'
 
   deactivateResources: ->
     grammar.deactivate() for grammar in @grammars
     settings.deactivate() for settings in @settings
     @stylesheetDisposables?.dispose()
     @activationDisposables?.dispose()
+    @keymapDisposables?.dispose()
     @stylesheetsActivated = false
     @grammarsActivated = false
     @settingsActivated = false
+    @menusActivated = false
 
   reloadStylesheets: ->
-    oldSheets = _.clone(@stylesheets)
-
     try
       @loadStylesheets()
     catch error
@@ -389,25 +554,36 @@ class Package
     @activateStylesheets()
 
   requireMainModule: ->
-    return @mainModule if @mainModuleRequired
-    unless @isCompatible()
+    if @bundledPackage and @packageManager.packagesCache[@name]?
+      if @packageManager.packagesCache[@name].main?
+        @mainModule = require(@packageManager.packagesCache[@name].main)
+    else if @mainModuleRequired
+      @mainModule
+    else if not @isCompatible()
       console.warn """
-        Failed to require the main module of '#{@name}' because it requires an incompatible native module.
-        Run `apm rebuild` in the package directory to resolve.
+        Failed to require the main module of '#{@name}' because it requires one or more incompatible native modules (#{_.pluck(@incompatibleModules, 'name').join(', ')}).
+        Run `apm rebuild` in the package directory and restart Atom to resolve.
       """
       return
-    mainModulePath = @getMainModulePath()
-    if fs.isFileSync(mainModulePath)
-      @mainModuleRequired = true
-      @mainModule = require(mainModulePath)
+    else
+      mainModulePath = @getMainModulePath()
+      if fs.isFileSync(mainModulePath)
+        @mainModuleRequired = true
+
+        previousViewProviderCount = @viewRegistry.getViewProviderCount()
+        previousDeserializerCount = @deserializerManager.getDeserializerCount()
+        @mainModule = require(mainModulePath)
+        if (@viewRegistry.getViewProviderCount() is previousViewProviderCount and
+            @deserializerManager.getDeserializerCount() is previousDeserializerCount)
+          localStorage.setItem(@getCanDeferMainModuleRequireStorageKey(), 'true')
 
   getMainModulePath: ->
     return @mainModulePath if @resolvedMainModulePath
     @resolvedMainModulePath = true
 
-    if @bundledPackage and packagesCache[@name]?
-      if packagesCache[@name].main
-        @mainModulePath = "#{atom.packages.resourcePath}#{path.sep}#{packagesCache[@name].main}"
+    if @bundledPackage and @packageManager.packagesCache[@name]?
+      if @packageManager.packagesCache[@name].main
+        @mainModulePath = path.resolve(@packageManager.resourcePath, 'static', @packageManager.packagesCache[@name].main)
       else
         @mainModulePath = null
     else
@@ -416,12 +592,22 @@ class Package
           path.join(@path, @metadata.main)
         else
           path.join(@path, 'index')
-      @mainModulePath = fs.resolveExtension(mainModulePath, ["", _.keys(require.extensions)...])
+      @mainModulePath = fs.resolveExtension(mainModulePath, ["", CompileCache.supportedExtensions...])
+
+  activationShouldBeDeferred: ->
+    @hasActivationCommands() or @hasActivationHooks()
+
+  hasActivationHooks: ->
+    @getActivationHooks()?.length > 0
 
   hasActivationCommands: ->
     for selector, commands of @getActivationCommands()
       return true if commands.length > 0
     false
+
+  subscribeToDeferredActivation: ->
+    @subscribeToActivationCommands()
+    @subscribeToActivationHooks()
 
   subscribeToActivationCommands: ->
     @activationCommandSubscriptions = new CompositeDisposable
@@ -431,7 +617,7 @@ class Package
           # Add dummy command so it appears in menu.
           # The real command will be registered on package activation
           try
-            @activationCommandSubscriptions.add atom.commands.add selector, command, ->
+            @activationCommandSubscriptions.add @commandRegistry.add selector, command, ->
           catch error
             if error.code is 'EBADSELECTOR'
               metadataPath = path.join(@path, 'package.json')
@@ -439,7 +625,7 @@ class Package
               error.stack += "\n  at #{metadataPath}:1:1"
             throw error
 
-          @activationCommandSubscriptions.add atom.commands.onWillDispatch (event) =>
+          @activationCommandSubscriptions.add @commandRegistry.onWillDispatch (event) =>
             return unless event.type is command
             currentTarget = event.target
             while currentTarget
@@ -464,32 +650,28 @@ class Package
         else if _.isArray(commands)
           @activationCommands[selector].push(commands...)
 
-    if includeDeprecatedAPIs and @metadata.activationEvents?
-      deprecate """
-        Use `activationCommands` instead of `activationEvents` in your package.json
-        Commands should be grouped by selector as follows:
-        ```json
-          "activationCommands": {
-            "atom-workspace": ["foo:bar", "foo:baz"],
-            "atom-text-editor": ["foo:quux"]
-          }
-        ```
-      """
-      if _.isArray(@metadata.activationEvents)
-        for eventName in @metadata.activationEvents
-          @activationCommands['atom-workspace'] ?= []
-          @activationCommands['atom-workspace'].push(eventName)
-      else if _.isString(@metadata.activationEvents)
-        eventName = @metadata.activationEvents
-        @activationCommands['atom-workspace'] ?= []
-        @activationCommands['atom-workspace'].push(eventName)
-      else
-        for eventName, selector of @metadata.activationEvents
-          selector ?= 'atom-workspace'
-          @activationCommands[selector] ?= []
-          @activationCommands[selector].push(eventName)
-
     @activationCommands
+
+  subscribeToActivationHooks: ->
+    @activationHookSubscriptions = new CompositeDisposable
+    for hook in @getActivationHooks()
+      do (hook) =>
+        @activationHookSubscriptions.add(@packageManager.onDidTriggerActivationHook(hook, => @activateNow())) if hook? and _.isString(hook) and hook.trim().length > 0
+
+    return
+
+  getActivationHooks: ->
+    return @activationHooks if @metadata? and @activationHooks?
+
+    @activationHooks = []
+
+    if @metadata.activationHooks?
+      if _.isArray(@metadata.activationHooks)
+        @activationHooks.push(@metadata.activationHooks...)
+      else if _.isString(@metadata.activationHooks)
+        @activationHooks.push(@metadata.activationHooks)
+
+    @activationHooks = _.uniq(@activationHooks)
 
   # Does the given module path contain native code?
   isNativeModule: (modulePath) ->
@@ -499,9 +681,19 @@ class Package
       false
 
   # Get an array of all the native modules that this package depends on.
-  # This will recurse through all dependencies.
+  #
+  # First try to get this information from
+  # @metadata._atomModuleCache.extensions. If @metadata._atomModuleCache doesn't
+  # exist, recurse through all dependencies.
   getNativeModuleDependencyPaths: ->
     nativeModulePaths = []
+
+    if @metadata._atomModuleCache?
+      relativeNativeModuleBindingPaths = @metadata._atomModuleCache.extensions?['.node'] ? []
+      for relativeNativeModuleBindingPath in relativeNativeModuleBindingPaths
+        nativeModulePath = path.join(@path, relativeNativeModuleBindingPath, '..', '..', '..')
+        nativeModulePaths.push(nativeModulePath)
+      return nativeModulePaths
 
     traversePath = (nodeModulesPath) =>
       try
@@ -513,6 +705,73 @@ class Package
     traversePath(path.join(@path, 'node_modules'))
     nativeModulePaths
 
+  ###
+  Section: Native Module Compatibility
+  ###
+
+  # Extended: Are all native modules depended on by this package correctly
+  # compiled against the current version of Atom?
+  #
+  # Incompatible packages cannot be activated.
+  #
+  # Returns a {Boolean}, true if compatible, false if incompatible.
+  isCompatible: ->
+    return @compatible if @compatible?
+
+    if @preloadedPackage
+      # Preloaded packages are always considered compatible
+      @compatible = true
+    else if @getMainModulePath()
+      @incompatibleModules = @getIncompatibleNativeModules()
+      @compatible = @incompatibleModules.length is 0 and not @getBuildFailureOutput()?
+    else
+      @compatible = true
+
+  # Extended: Rebuild native modules in this package's dependencies for the
+  # current version of Atom.
+  #
+  # Returns a {Promise} that resolves with an object containing `code`,
+  # `stdout`, and `stderr` properties based on the results of running
+  # `apm rebuild` on the package.
+  rebuild: ->
+    new Promise (resolve) =>
+      @runRebuildProcess (result) =>
+        if result.code is 0
+          global.localStorage.removeItem(@getBuildFailureOutputStorageKey())
+        else
+          @compatible = false
+          global.localStorage.setItem(@getBuildFailureOutputStorageKey(), result.stderr)
+        global.localStorage.setItem(@getIncompatibleNativeModulesStorageKey(), '[]')
+        resolve(result)
+
+  # Extended: If a previous rebuild failed, get the contents of stderr.
+  #
+  # Returns a {String} or null if no previous build failure occurred.
+  getBuildFailureOutput: ->
+    global.localStorage.getItem(@getBuildFailureOutputStorageKey())
+
+  runRebuildProcess: (callback) ->
+    stderr = ''
+    stdout = ''
+    new BufferedProcess({
+      command: @packageManager.getApmPath()
+      args: ['rebuild', '--no-color']
+      options: {cwd: @path}
+      stderr: (output) -> stderr += output
+      stdout: (output) -> stdout += output
+      exit: (code) -> callback({code, stdout, stderr})
+    })
+
+  getBuildFailureOutputStorageKey: ->
+    "installed-packages:#{@name}:#{@metadata.version}:build-error"
+
+  getIncompatibleNativeModulesStorageKey: ->
+    electronVersion = process.versions.electron
+    "installed-packages:#{@name}:#{@metadata.version}:electron-#{electronVersion}:incompatible-native-modules"
+
+  getCanDeferMainModuleRequireStorageKey: ->
+    "installed-packages:#{@name}:#{@metadata.version}:can-defer-main-module-require"
+
   # Get the incompatible native modules that this package depends on.
   # This recurses through all dependencies and requires all modules that
   # contain a `.node` file.
@@ -520,11 +779,10 @@ class Package
   # This information is cached in local storage on a per package/version basis
   # to minimize the impact on startup time.
   getIncompatibleNativeModules: ->
-    localStorageKey = "installed-packages:#{@name}:#{@metadata.version}"
-    unless atom.inDevMode()
+    unless @packageManager.devMode
       try
-        {incompatibleNativeModules} = JSON.parse(global.localStorage.getItem(localStorageKey)) ? {}
-      return incompatibleNativeModules if incompatibleNativeModules?
+        if arrayAsString = global.localStorage.getItem(@getIncompatibleNativeModulesStorageKey())
+          return JSON.parse(arrayAsString)
 
     incompatibleNativeModules = []
     for nativeModulePath in @getNativeModuleDependencyPaths()
@@ -539,29 +797,13 @@ class Package
           version: version
           error: error.message
 
-    global.localStorage.setItem(localStorageKey, JSON.stringify({incompatibleNativeModules}))
+    global.localStorage.setItem(@getIncompatibleNativeModulesStorageKey(), JSON.stringify(incompatibleNativeModules))
     incompatibleNativeModules
 
-  # Public: Is this package compatible with this version of Atom?
-  #
-  # Incompatible packages cannot be activated. This will include packages
-  # installed to ~/.atom/packages that were built against node 0.11.10 but
-  # now need to be upgrade to node 0.11.13.
-  #
-  # Returns a {Boolean}, true if compatible, false if incompatible.
-  isCompatible: ->
-    return @compatible if @compatible?
-
-    if @path.indexOf(path.join(atom.packages.resourcePath, 'node_modules') + path.sep) is 0
-      # Bundled packages are always considered compatible
-      @compatible = true
-    else if @getMainModulePath()
-      @incompatibleModules = @getIncompatibleNativeModules()
-      @compatible = @incompatibleModules.length is 0
-    else
-      @compatible = true
-
   handleError: (message, error) ->
+    if atom.inSpecMode()
+      throw error
+
     if error.filename and error.location and (error instanceof SyntaxError)
       location = "#{error.filename}:#{error.location.first_line + 1}:#{error.location.first_column + 1}"
       detail = "#{error.message} in #{location}"
@@ -581,16 +823,4 @@ class Package
       detail = error.message
       stack = error.stack ? error
 
-    atom.notifications.addFatalError(message, {stack, detail, dismissable: true})
-
-if includeDeprecatedAPIs
-  EmitterMixin = require('emissary').Emitter
-  EmitterMixin.includeInto(Package)
-
-  Package::on = (eventName) ->
-    switch eventName
-      when 'deactivated'
-        deprecate 'Use Package::onDidDeactivate instead'
-      else
-        deprecate 'Package::on is deprecated. Use event subscription methods instead.'
-    EmitterMixin::on.apply(this, arguments)
+    @notificationManager.addFatalError(message, {stack, detail, packageName: @name, dismissable: true})

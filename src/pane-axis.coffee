@@ -1,18 +1,20 @@
 {Emitter, CompositeDisposable} = require 'event-kit'
 {flatten} = require 'underscore-plus'
-Serializable = require 'serializable'
 Model = require './model'
+PaneAxisElement = require './pane-axis-element'
 
 module.exports =
 class PaneAxis extends Model
-  atom.deserializers.add(this)
-  Serializable.includeInto(this)
-
   parent: null
   container: null
   orientation: null
 
-  constructor: ({@container, @orientation, children, flexScale}={}) ->
+  @deserialize: (state, {deserializers, views}) ->
+    state.children = state.children.map (childState) ->
+      deserializers.deserialize(childState)
+    new this(state, views)
+
+  constructor: ({@orientation, children, flexScale}, @viewRegistry) ->
     @emitter = new Emitter
     @subscriptionsByChild = new WeakMap
     @subscriptions = new CompositeDisposable
@@ -21,15 +23,14 @@ class PaneAxis extends Model
       @addChild(child) for child in children
     @flexScale = flexScale ? 1
 
-  deserializeParams: (params) ->
-    {container} = params
-    params.children = params.children.map (childState) -> atom.deserializers.deserialize(childState, {container})
-    params
-
-  serializeParams: ->
+  serialize: ->
+    deserializer: 'PaneAxis'
     children: @children.map (child) -> child.serialize()
     orientation: @orientation
     flexScale: @flexScale
+
+  getElement: ->
+    @element ?= new PaneAxisElement().initialize(this, @viewRegistry)
 
   getFlexScale: -> @flexScale
 
@@ -43,7 +44,10 @@ class PaneAxis extends Model
 
   getContainer: -> @container
 
-  setContainer: (@container) -> @container
+  setContainer: (container) ->
+    if container and container isnt @container
+      @container = container
+      child.setContainer(container) for child in @children
 
   getOrientation: -> @orientation
 
@@ -65,7 +69,7 @@ class PaneAxis extends Model
     @emitter.on 'did-replace-child', fn
 
   onDidDestroy: (fn) ->
-    @emitter.on 'did-destroy', fn
+    @emitter.once 'did-destroy', fn
 
   onDidChangeFlexScale: (fn) ->
     @emitter.on 'did-change-flex-scale', fn
@@ -75,12 +79,10 @@ class PaneAxis extends Model
     @onDidChangeFlexScale(fn)
 
   addChild: (child, index=@children.length) ->
+    @children.splice(index, 0, child)
     child.setParent(this)
     child.setContainer(@container)
-
     @subscribeToChild(child)
-
-    @children.splice(index, 0, child)
     @emitter.emit 'did-add-child', {child, index}
 
   adjustFlexScale: ->

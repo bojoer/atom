@@ -1,5 +1,4 @@
 ViewRegistry = require '../src/view-registry'
-{View} = require '../src/space-pen-extensions'
 
 describe "ViewRegistry", ->
   registry = null
@@ -7,21 +6,31 @@ describe "ViewRegistry", ->
   beforeEach ->
     registry = new ViewRegistry
 
+  afterEach ->
+    registry.clearDocumentRequests()
+
   describe "::getView(object)", ->
     describe "when passed a DOM node", ->
       it "returns the given DOM node", ->
         node = document.createElement('div')
         expect(registry.getView(node)).toBe node
 
-    describe "when passed a SpacePen view", ->
-      it "returns the root node of the view with a .spacePenView property pointing at the SpacePen view", ->
-        class TestView extends View
-          @content: -> @div "Hello"
+    describe "when passed an object with an element property", ->
+      it "returns the element property if it's an instance of HTMLElement", ->
+        class TestComponent
+          constructor: -> @element = document.createElement('div')
 
-        view = new TestView
-        node = registry.getView(view)
-        expect(node.textContent).toBe "Hello"
-        expect(node.spacePenView).toBe view
+        component = new TestComponent
+        expect(registry.getView(component)).toBe component.element
+
+    describe "when passed an object with a getElement function", ->
+      it "returns the return value of getElement if it's an instance of HTMLElement", ->
+        class TestComponent
+          getElement: ->
+            @myElement ?= document.createElement('div')
+
+        component = new TestComponent
+        expect(registry.getView(component)).toBe component.myElement
 
     describe "when passed a model object", ->
       describe "when a view provider is registered matching the object's constructor", ->
@@ -47,31 +56,24 @@ describe "ViewRegistry", ->
           expect(view2 instanceof TestView).toBe true
           expect(view2.model).toBe subclassModel
 
+      describe "when a view provider is registered generically, and works with the object", ->
+        it "constructs a view element and assigns the model on it", ->
+          model = {a: 'b'}
+
+          registry.addViewProvider (model) ->
+            if model.a is 'b'
+              element = document.createElement('div')
+              element.className = 'test-element'
+              element
+
+          view = registry.getView({a: 'b'})
+          expect(view.className).toBe 'test-element'
+
+          expect(-> registry.getView({a: 'c'})).toThrow()
+
       describe "when no view provider is registered for the object's constructor", ->
-        describe "when the object has a .getViewClass() method", ->
-          it "builds an instance of the view class with the model, then returns its root node with a __spacePenView property pointing at the view", ->
-            class TestView extends View
-              @content: (model) -> @div model.name
-              initialize: (@model) ->
-
-            class TestModel
-              constructor: (@name) ->
-              getViewClass: -> TestView
-
-            model = new TestModel("hello")
-            node = registry.getView(model)
-
-            expect(node.textContent).toBe "hello"
-            view = node.spacePenView
-            expect(view instanceof TestView).toBe true
-            expect(view.model).toBe model
-
-            # returns the same DOM node for repeated calls
-            expect(registry.getView(model)).toBe node
-
-        describe "when the object has no .getViewClass() method", ->
-          it "throws an exception", ->
-            expect(-> registry.getView(new Object)).toThrow()
+        it "throws an exception", ->
+          expect(-> registry.getView(new Object)).toThrow()
 
   describe "::addViewProvider(providerSpec)", ->
     it "returns a disposable that can be used to remove the provider", ->
@@ -119,59 +121,43 @@ describe "ViewRegistry", ->
       frameRequests[0]()
       expect(events).toEqual ['write 4', 'read 3']
 
-    it "pauses DOM polling when reads or writes are pending", ->
+    it "performs writes requested from read callbacks in the same animation frame", ->
       spyOn(window, 'setInterval').andCallFake(fakeSetInterval)
       spyOn(window, 'clearInterval').andCallFake(fakeClearInterval)
       events = []
 
-      registry.pollDocument -> events.push('poll')
-      registry.updateDocument -> events.push('write')
-      registry.readDocument -> events.push('read')
+      registry.updateDocument -> events.push('write 1')
+      registry.readDocument ->
+        registry.updateDocument -> events.push('write from read 1')
+        events.push('read 1')
+      registry.readDocument ->
+        registry.updateDocument -> events.push('write from read 2')
+        events.push('read 2')
+      registry.updateDocument -> events.push('write 2')
 
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual []
-
+      expect(frameRequests.length).toBe 1
       frameRequests[0]()
-      expect(events).toEqual ['write', 'read', 'poll']
+      expect(frameRequests.length).toBe 1
 
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual ['write', 'read', 'poll', 'poll']
+      expect(events).toEqual [
+        'write 1'
+        'write 2'
+        'read 1'
+        'read 2'
+        'write from read 1'
+        'write from read 2'
+      ]
 
-    it "polls the document after updating when ::pollAfterNextUpdate() has been called", ->
-      events = []
-      registry.pollDocument -> events.push('poll')
-      registry.updateDocument -> events.push('write')
-      registry.readDocument -> events.push('read')
-      frameRequests.shift()()
-      expect(events).toEqual ['write', 'read']
+  describe "::getNextUpdatePromise()", ->
+    it "returns a promise that resolves at the end of the next update cycle", ->
+      updateCalled = false
+      readCalled = false
 
-      events = []
-      registry.pollAfterNextUpdate()
-      registry.updateDocument -> events.push('write')
-      registry.readDocument -> events.push('read')
-      frameRequests.shift()()
-      expect(events).toEqual ['write', 'read', 'poll']
+      waitsFor 'getNextUpdatePromise to resolve', (done) ->
+        registry.getNextUpdatePromise().then ->
+          expect(updateCalled).toBe true
+          expect(readCalled).toBe true
+          done()
 
-  describe "::pollDocument(fn)", ->
-    it "calls all registered reader functions on an interval until they are disabled via a returned disposable", ->
-      spyOn(window, 'setInterval').andCallFake(fakeSetInterval)
-
-      events = []
-      disposable1 = registry.pollDocument -> events.push('poll 1')
-      disposable2 = registry.pollDocument -> events.push('poll 2')
-
-      expect(events).toEqual []
-
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual ['poll 1', 'poll 2']
-
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual ['poll 1', 'poll 2', 'poll 1', 'poll 2']
-
-      disposable1.dispose()
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual ['poll 1', 'poll 2', 'poll 1', 'poll 2', 'poll 2']
-
-      disposable2.dispose()
-      advanceClock(registry.documentPollingInterval)
-      expect(events).toEqual ['poll 1', 'poll 2', 'poll 1', 'poll 2', 'poll 2']
+        registry.updateDocument -> updateCalled = true
+        registry.readDocument -> readCalled = true

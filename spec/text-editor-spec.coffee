@@ -1,5 +1,7 @@
+path = require 'path'
 clipboard = require '../src/safe-clipboard'
 TextEditor = require '../src/text-editor'
+TextBuffer = require 'text-buffer'
 
 describe "TextEditor", ->
   [buffer, editor, lineLengths] = []
@@ -9,10 +11,11 @@ describe "TextEditor", ->
 
   beforeEach ->
     waitsForPromise ->
-      atom.project.open('sample.js', autoIndent: false).then (o) -> editor = o
+      atom.workspace.open('sample.js', {autoIndent: false}).then (o) -> editor = o
 
     runs ->
       buffer = editor.buffer
+      editor.update({autoIndent: false})
       lineLengths = buffer.getLines().map (line) -> line.length
 
     waitsForPromise ->
@@ -25,97 +28,116 @@ describe "TextEditor", ->
       editor.foldBufferRow(4)
       expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
 
-      editor2 = editor.testSerialization()
+      waitsForPromise ->
+        TextBuffer.deserialize(editor.buffer.serialize()).then (buffer2) ->
+          editor2 = TextEditor.deserialize(editor.serialize(), {
+            assert: atom.assert,
+            textEditors: atom.textEditors,
+            project: {bufferForIdSync: -> buffer2}
+          })
 
-      expect(editor2.id).toBe editor.id
-      expect(editor2.getBuffer().getPath()).toBe editor.getBuffer().getPath()
-      expect(editor2.getSelectedBufferRanges()).toEqual [[[1, 2], [3, 4]], [[5, 6], [7, 5]]]
-      expect(editor2.getSelections()[1].isReversed()).toBeTruthy()
-      expect(editor2.isFoldedAtBufferRow(4)).toBeTruthy()
-      editor2.destroy()
+          expect(editor2.id).toBe editor.id
+          expect(editor2.getBuffer().getPath()).toBe editor.getBuffer().getPath()
+          expect(editor2.getSelectedBufferRanges()).toEqual [[[1, 2], [3, 4]], [[5, 6], [7, 5]]]
+          expect(editor2.getSelections()[1].isReversed()).toBeTruthy()
+          expect(editor2.isFoldedAtBufferRow(4)).toBeTruthy()
+          editor2.destroy()
 
-    it "preserves the invisibles setting", ->
-      atom.config.set('editor.showInvisibles', true)
-      previousInvisibles = editor.displayBuffer.invisibles
+    it "restores the editor's layout configuration", ->
+      editor.update({
+        softTabs: true
+        atomicSoftTabs: false
+        tabLength: 12
+        softWrapped: true
+        softWrapAtPreferredLineLength: true
+        softWrapHangingIndentLength: 8
+        invisibles: {space: 'S'}
+        showInvisibles: true
+        editorWidthInChars: 120
+      })
 
-      editor2 = editor.testSerialization()
+      # Force buffer and display layer to be deserialized as well, rather than
+      # reusing the same buffer instance
+      waitsForPromise ->
+        TextBuffer.deserialize(editor.buffer.serialize()).then (buffer2) ->
+          editor2 = TextEditor.deserialize(editor.serialize(), {
+            assert: atom.assert,
+            textEditors: atom.textEditors,
+            project: {bufferForIdSync: -> buffer2}
+          })
 
-      expect(editor2.displayBuffer.invisibles).toEqual previousInvisibles
-      expect(editor2.displayBuffer.tokenizedBuffer.invisibles).toEqual previousInvisibles
+          expect(editor2.getSoftTabs()).toBe(editor.getSoftTabs())
+          expect(editor2.hasAtomicSoftTabs()).toBe(editor.hasAtomicSoftTabs())
+          expect(editor2.getTabLength()).toBe(editor.getTabLength())
+          expect(editor2.getSoftWrapColumn()).toBe(editor.getSoftWrapColumn())
+          expect(editor2.getSoftWrapHangingIndentLength()).toBe(editor.getSoftWrapHangingIndentLength())
+          expect(editor2.getInvisibles()).toEqual(editor.getInvisibles())
+          expect(editor2.getEditorWidthInChars()).toBe(editor.getEditorWidthInChars())
+          expect(editor2.displayLayer.tabLength).toBe(editor2.getTabLength())
+          expect(editor2.displayLayer.softWrapColumn).toBe(editor2.getSoftWrapColumn())
 
-    it "updates invisibles if the settings have changed between serialization and deserialization", ->
-      atom.config.set('editor.showInvisibles', true)
-      previousInvisibles = editor.displayBuffer.invisibles
+    it "ignores buffers with retired IDs", ->
+      editor2 = TextEditor.deserialize(editor.serialize(), {
+        assert: atom.assert,
+        textEditors: atom.textEditors,
+        project: {bufferForIdSync: -> null}
+      })
 
-      state = editor.serialize()
-      atom.config.set('editor.invisibles', eol: '?')
-      editor2 = TextEditor.deserialize(state)
+      expect(editor2).toBeNull()
 
-      expect(editor2.displayBuffer.invisibles.eol).toBe '?'
-      expect(editor2.displayBuffer.tokenizedBuffer.invisibles.eol).toBe '?'
-
-  describe "when the editor is constructed with an initialLine option", ->
-    it "positions the cursor on the specified line", ->
+  describe "when the editor is constructed with the largeFileMode option set to true", ->
+    it "loads the editor but doesn't tokenize", ->
       editor = null
 
       waitsForPromise ->
-        atom.workspace.open('sample.less', initialLine: 5).then (o) -> editor = o
+        atom.workspace.openTextFile('sample.js', largeFileMode: true).then (o) -> editor = o
 
       runs ->
-        expect(editor.getLastCursor().getBufferPosition().row).toEqual 5
-        expect(editor.getLastCursor().getBufferPosition().column).toEqual 0
-
-  describe "when the editor is constructed with an initialColumn option", ->
-    it "positions the cursor on the specified column", ->
-      editor = null
-
-      waitsForPromise ->
-        atom.workspace.open('sample.less', initialColumn: 8).then (o) -> editor = o
-
-      runs ->
-        expect(editor.getLastCursor().getBufferPosition().row).toEqual 0
-        expect(editor.getLastCursor().getBufferPosition().column).toEqual 8
-
-  describe "when the editor is reopened with an initialLine option", ->
-    it "positions the cursor on the specified line", ->
-      editor = null
-
-      waitsForPromise ->
-        atom.workspace.open('sample.less', initialLine: 5).then (o) -> editor = o
-
-      waitsForPromise ->
-        atom.workspace.open('sample.less', initialLine: 4).then (o) -> editor = o
-
-      runs ->
-        expect(editor.getLastCursor().getBufferPosition().row).toEqual 4
-        expect(editor.getLastCursor().getBufferPosition().column).toEqual 0
-
-  describe "when the editor is reopened with an initialColumn option", ->
-    it "positions the cursor on the specified column", ->
-      editor = null
-
-      waitsForPromise ->
-        atom.workspace.open('sample.less', initialColumn: 8).then (o) -> editor = o
-
-      waitsForPromise ->
-        atom.workspace.open('sample.less', initialColumn: 7).then (o) -> editor = o
-
-      runs ->
-        expect(editor.getLastCursor().getBufferPosition().row).toEqual 0
-        expect(editor.getLastCursor().getBufferPosition().column).toEqual 7
+        buffer = editor.getBuffer()
+        expect(editor.lineTextForScreenRow(0)).toBe buffer.lineForRow(0)
+        expect(editor.tokensForScreenRow(0).length).toBe 1
+        expect(editor.tokensForScreenRow(1).length).toBe 2 # soft tab
+        expect(editor.lineTextForScreenRow(12)).toBe buffer.lineForRow(12)
+        expect(editor.getCursorScreenPosition()).toEqual [0, 0]
+        editor.insertText('hey"')
+        expect(editor.tokensForScreenRow(0).length).toBe 1
+        expect(editor.tokensForScreenRow(1).length).toBe 2 # soft tab
 
   describe ".copy()", ->
-    it "returns a different edit session with the same initial state", ->
+    it "returns a different editor with the same initial state", ->
+      expect(editor.getAutoHeight()).toBeFalsy()
+      expect(editor.getAutoWidth()).toBeFalsy()
+      expect(editor.getShowCursorOnSelection()).toBeTruthy()
+
+      element = editor.getElement()
+      element.setHeight(100)
+      element.setWidth(100)
+      jasmine.attachToDOM(element)
+
+      editor.update({showCursorOnSelection: false})
       editor.setSelectedBufferRange([[1, 2], [3, 4]])
       editor.addSelectionForBufferRange([[5, 6], [7, 8]], reversed: true)
+      editor.setScrollTopRow(3)
+      expect(editor.getScrollTopRow()).toBe(3)
+      editor.setScrollLeftColumn(4)
+      expect(editor.getScrollLeftColumn()).toBe(4)
       editor.foldBufferRow(4)
       expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
 
       editor2 = editor.copy()
+      element2 = editor2.getElement()
+      element2.setHeight(100)
+      element2.setWidth(100)
+      jasmine.attachToDOM(element2)
       expect(editor2.id).not.toBe editor.id
       expect(editor2.getSelectedBufferRanges()).toEqual editor.getSelectedBufferRanges()
       expect(editor2.getSelections()[1].isReversed()).toBeTruthy()
+      expect(editor2.getScrollTopRow()).toBe(3)
+      expect(editor2.getScrollLeftColumn()).toBe(4)
       expect(editor2.isFoldedAtBufferRow(4)).toBeTruthy()
+      expect(editor2.getAutoWidth()).toBe(false)
+      expect(editor2.getAutoHeight()).toBe(false)
+      expect(editor2.getShowCursorOnSelection()).toBeFalsy()
 
       # editor2 can now diverge from its origin edit session
       editor2.getLastSelection().setBufferRange([[2, 1], [4, 3]])
@@ -123,56 +145,30 @@ describe "TextEditor", ->
       editor2.unfoldBufferRow(4)
       expect(editor2.isFoldedAtBufferRow(4)).not.toBe editor.isFoldedAtBufferRow(4)
 
-  describe "config defaults", ->
-    it "uses the `editor.tabLength`, `editor.softWrap`, and `editor.softTabs`, and `core.fileEncoding` config values", ->
-      editor1 = null
-      editor2 = null
-      atom.config.set('editor.tabLength', 4)
-      atom.config.set('editor.softWrap', true)
-      atom.config.set('editor.softTabs', false)
-      atom.config.set('core.fileEncoding', 'utf16le')
+  describe ".update()", ->
+    it "updates the editor with the supplied config parameters", ->
+      element = editor.element # force element initialization
+      element.setUpdatedSynchronously(false)
+      editor.update({showInvisibles: true})
+      editor.onDidChange(changeSpy = jasmine.createSpy('onDidChange'))
 
-      waitsForPromise ->
-        atom.workspace.open('a').then (o) -> editor1 = o
+      returnedPromise = editor.update({
+        tabLength: 6, softTabs: false, softWrapped: true, editorWidthInChars: 40,
+        showInvisibles: false, mini: false, lineNumberGutterVisible: false, scrollPastEnd: true,
+        autoHeight: false, maxScreenLineLength: 1000
+      })
 
-      runs ->
-        expect(editor1.getTabLength()).toBe 4
-        expect(editor1.isSoftWrapped()).toBe true
-        expect(editor1.getSoftTabs()).toBe false
-        expect(editor1.getEncoding()).toBe 'utf16le'
-
-        atom.config.set('editor.tabLength', 8)
-        atom.config.set('editor.softWrap', false)
-        atom.config.set('editor.softTabs', true)
-        atom.config.set('core.fileEncoding', 'macroman')
-
-      waitsForPromise ->
-        atom.workspace.open('b').then (o) -> editor2 = o
-
-      runs ->
-        expect(editor2.getTabLength()).toBe 8
-        expect(editor2.isSoftWrapped()).toBe false
-        expect(editor2.getSoftTabs()).toBe true
-        expect(editor2.getEncoding()).toBe 'macroman'
-
-    it "uses scoped `core.fileEncoding` values", ->
-      editor1 = null
-      editor2 = null
-
-      atom.config.set('core.fileEncoding', 'utf16le')
-      atom.config.set('core.fileEncoding', 'macroman', scopeSelector: '.js')
-
-      waitsForPromise ->
-        atom.workspace.open('a').then (o) -> editor1 = o
-
-      runs ->
-        expect(editor1.getEncoding()).toBe 'utf16le'
-
-      waitsForPromise ->
-        atom.workspace.open('test.js').then (o) -> editor2 = o
-
-      runs ->
-        expect(editor2.getEncoding()).toBe 'macroman'
+      expect(returnedPromise).toBe(element.component.getNextUpdatePromise())
+      expect(changeSpy.callCount).toBe(1)
+      expect(editor.getTabLength()).toBe(6)
+      expect(editor.getSoftTabs()).toBe(false)
+      expect(editor.isSoftWrapped()).toBe(true)
+      expect(editor.getEditorWidthInChars()).toBe(40)
+      expect(editor.getInvisibles()).toEqual({})
+      expect(editor.isMini()).toBe(false)
+      expect(editor.isLineNumberGutterVisible()).toBe(false)
+      expect(editor.getScrollPastEnd()).toBe(true)
+      expect(editor.getAutoHeight()).toBe(false)
 
   describe "title", ->
     describe ".getTitle()", ->
@@ -182,10 +178,48 @@ describe "TextEditor", ->
         expect(editor.getTitle()).toBe 'untitled'
 
     describe ".getLongTitle()", ->
-      it "appends the name of the containing directory to the basename of the file", ->
-        expect(editor.getLongTitle()).toBe 'sample.js - fixtures'
+      it "returns file name when there is no opened file with identical name", ->
+        expect(editor.getLongTitle()).toBe 'sample.js'
         buffer.setPath(undefined)
         expect(editor.getLongTitle()).toBe 'untitled'
+
+      it "returns '<filename> — <parent-directory>' when opened files have identical file names", ->
+        editor1 = null
+        editor2 = null
+        waitsForPromise ->
+          atom.workspace.open(path.join('sample-theme-1', 'readme')).then (o) ->
+            editor1 = o
+            atom.workspace.open(path.join('sample-theme-2', 'readme')).then (o) ->
+              editor2 = o
+        runs ->
+          expect(editor1.getLongTitle()).toBe "readme \u2014 sample-theme-1"
+          expect(editor2.getLongTitle()).toBe "readme \u2014 sample-theme-2"
+
+      it "returns '<filename> — <parent-directories>' when opened files have identical file names in subdirectories", ->
+        editor1 = null
+        editor2 = null
+        path1 = path.join('sample-theme-1', 'src', 'js')
+        path2 = path.join('sample-theme-2', 'src', 'js')
+        waitsForPromise ->
+          atom.workspace.open(path.join(path1, 'main.js')).then (o) ->
+            editor1 = o
+            atom.workspace.open(path.join(path2, 'main.js')).then (o) ->
+              editor2 = o
+        runs ->
+          expect(editor1.getLongTitle()).toBe "main.js \u2014 #{path1}"
+          expect(editor2.getLongTitle()).toBe "main.js \u2014 #{path2}"
+
+      it "returns '<filename> — <parent-directories>' when opened files have identical file and same parent dir name", ->
+        editor1 = null
+        editor2 = null
+        waitsForPromise ->
+          atom.workspace.open(path.join('sample-theme-2', 'src', 'js', 'main.js')).then (o) ->
+            editor1 = o
+            atom.workspace.open(path.join('sample-theme-2', 'src', 'js', 'plugin', 'main.js')).then (o) ->
+              editor2 = o
+        runs ->
+          expect(editor1.getLongTitle()).toBe "main.js \u2014 js"
+          expect(editor2.getLongTitle()).toBe "main.js \u2014 " + path.join('js', 'plugin')
 
     it "notifies ::onDidChangeTitle observers when the underlying buffer path changes", ->
       observed = []
@@ -226,10 +260,19 @@ describe "TextEditor", ->
         lastCursor = editor.addCursorAtScreenPosition([2, 0])
         expect(editor.getLastCursor()).toBe lastCursor
 
+      it "creates a new cursor at (0, 0) if the last cursor has been destroyed", ->
+        editor.getLastCursor().destroy()
+        expect(editor.getLastCursor().getBufferPosition()).toEqual([0, 0])
+
+    describe ".getCursors()", ->
+      it "creates a new cursor at (0, 0) if the last cursor has been destroyed", ->
+        editor.getLastCursor().destroy()
+        expect(editor.getCursors()[0].getBufferPosition()).toEqual([0, 0])
+
     describe "when the cursor moves", ->
       it "clears a goal column established by vertical movement", ->
         editor.setText('b')
-        editor.setCursorBufferPosition([0,0])
+        editor.setCursorBufferPosition([0, 0])
         editor.insertNewline()
         editor.moveUp()
         editor.insertText('a')
@@ -264,7 +307,7 @@ describe "TextEditor", ->
         expect(editor.getCursorScreenPosition().column).not.toBe 6
 
         # clear the goal column by explicitly setting the cursor position
-        editor.setCursorScreenPosition([4,6])
+        editor.setCursorScreenPosition([4, 6])
         expect(editor.getCursorScreenPosition().column).toBe 6
 
         editor.moveDown()
@@ -282,12 +325,13 @@ describe "TextEditor", ->
       describe "when soft-wrap is enabled and code is folded", ->
         beforeEach ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(50)
-          editor.createFold(2, 3)
+          editor.foldBufferRowRange(2, 3)
 
         it "positions the cursor at the buffer position that corresponds to the given screen position", ->
           editor.setCursorScreenPosition([9, 0])
-          expect(editor.getCursorBufferPosition()).toEqual [8, 10]
+          expect(editor.getCursorBufferPosition()).toEqual [8, 11]
 
     describe ".moveUp()", ->
       it "moves the cursor up", ->
@@ -319,7 +363,7 @@ describe "TextEditor", ->
 
       describe "when there is a selection", ->
         beforeEach ->
-          editor.setSelectedBufferRange([[4, 9],[5, 10]])
+          editor.setSelectedBufferRange([[4, 9], [5, 10]])
 
         it "moves above the selection", ->
           cursor = editor.getLastCursor()
@@ -332,11 +376,12 @@ describe "TextEditor", ->
 
         editor.moveUp()
         expect(editor.getCursors()).toEqual [cursor1]
-        expect(cursor1.getBufferPosition()).toEqual [0,0]
+        expect(cursor1.getBufferPosition()).toEqual [0, 0]
 
       describe "when the cursor was moved down from the beginning of an indented soft-wrapped line", ->
         it "moves to the beginning of the previous line", ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(50)
 
           editor.setCursorScreenPosition([3, 0])
@@ -389,6 +434,7 @@ describe "TextEditor", ->
       describe "when the cursor is at the beginning of an indented soft-wrapped line", ->
         it "moves to the beginning of the line's continuation on the next screen row", ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(50)
 
           editor.setCursorScreenPosition([3, 0])
@@ -398,7 +444,7 @@ describe "TextEditor", ->
 
       describe "when there is a selection", ->
         beforeEach ->
-          editor.setSelectedBufferRange([[4, 9],[5, 10]])
+          editor.setSelectedBufferRange([[4, 9], [5, 10]])
 
         it "moves below the selection", ->
           cursor = editor.getLastCursor()
@@ -412,7 +458,7 @@ describe "TextEditor", ->
 
         editor.moveDown()
         expect(editor.getCursors()).toEqual [cursor1]
-        expect(cursor1.getBufferPosition()).toEqual [12,2]
+        expect(cursor1.getBufferPosition()).toEqual [12, 2]
 
     describe ".moveLeft()", ->
       it "moves the cursor by one column to the left", ->
@@ -456,12 +502,13 @@ describe "TextEditor", ->
         describe "when line is wrapped and follow previous line indentation", ->
           beforeEach ->
             editor.setSoftWrapped(true)
+            editor.setDefaultCharWidth(1)
             editor.setEditorWidthInChars(50)
 
           it "wraps to the end of the previous line", ->
             editor.setCursorScreenPosition([4, 4])
             editor.moveLeft()
-            expect(editor.getCursorScreenPosition()).toEqual [3, 50]
+            expect(editor.getCursorScreenPosition()).toEqual [3, 46]
 
         describe "when the cursor is on the first line", ->
           it "remains in the same position (0,0)", ->
@@ -483,7 +530,7 @@ describe "TextEditor", ->
 
       describe "when there is a selection", ->
         beforeEach ->
-          editor.setSelectedBufferRange([[5, 22],[5, 27]])
+          editor.setSelectedBufferRange([[5, 22], [5, 27]])
 
         it "moves to the left of the selection", ->
           cursor = editor.getLastCursor()
@@ -500,7 +547,7 @@ describe "TextEditor", ->
         [cursor1, cursor2] = editor.getCursors()
         editor.moveLeft()
         expect(editor.getCursors()).toEqual [cursor1]
-        expect(cursor1.getBufferPosition()).toEqual [0,0]
+        expect(cursor1.getBufferPosition()).toEqual [0, 0]
 
     describe ".moveRight()", ->
       it "moves the cursor by one column to the right", ->
@@ -555,7 +602,7 @@ describe "TextEditor", ->
 
       describe "when there is a selection", ->
         beforeEach ->
-          editor.setSelectedBufferRange([[5, 22],[5, 27]])
+          editor.setSelectedBufferRange([[5, 22], [5, 27]])
 
         it "moves to the left of the selection", ->
           cursor = editor.getLastCursor()
@@ -572,23 +619,23 @@ describe "TextEditor", ->
 
         editor.moveRight()
         expect(editor.getCursors()).toEqual [cursor1]
-        expect(cursor1.getBufferPosition()).toEqual [12,2]
+        expect(cursor1.getBufferPosition()).toEqual [12, 2]
 
     describe ".moveToTop()", ->
       it "moves the cursor to the top of the buffer", ->
-        editor.setCursorScreenPosition [11,1]
-        editor.addCursorAtScreenPosition [12,0]
+        editor.setCursorScreenPosition [11, 1]
+        editor.addCursorAtScreenPosition [12, 0]
         editor.moveToTop()
         expect(editor.getCursors().length).toBe 1
-        expect(editor.getCursorBufferPosition()).toEqual [0,0]
+        expect(editor.getCursorBufferPosition()).toEqual [0, 0]
 
     describe ".moveToBottom()", ->
-      it "moves the cusor to the bottom of the buffer", ->
-        editor.setCursorScreenPosition [0,0]
-        editor.addCursorAtScreenPosition [1,0]
+      it "moves the cursor to the bottom of the buffer", ->
+        editor.setCursorScreenPosition [0, 0]
+        editor.addCursorAtScreenPosition [1, 0]
         editor.moveToBottom()
         expect(editor.getCursors().length).toBe 1
-        expect(editor.getCursorBufferPosition()).toEqual [12,2]
+        expect(editor.getCursorBufferPosition()).toEqual [12, 2]
 
     describe ".moveToBeginningOfScreenLine()", ->
       describe "when soft wrap is on", ->
@@ -601,19 +648,20 @@ describe "TextEditor", ->
           expect(cursor.getScreenPosition()).toEqual [1, 0]
 
       describe "when soft wrap is off", ->
-        it "moves cursor to the beginning of then line", ->
-          editor.setCursorScreenPosition [0,5]
-          editor.addCursorAtScreenPosition [1,7]
+        it "moves cursor to the beginning of the line", ->
+          editor.setCursorScreenPosition [0, 5]
+          editor.addCursorAtScreenPosition [1, 7]
           editor.moveToBeginningOfScreenLine()
           expect(editor.getCursors().length).toBe 2
           [cursor1, cursor2] = editor.getCursors()
-          expect(cursor1.getBufferPosition()).toEqual [0,0]
-          expect(cursor2.getBufferPosition()).toEqual [1,0]
+          expect(cursor1.getBufferPosition()).toEqual [0, 0]
+          expect(cursor2.getBufferPosition()).toEqual [1, 0]
 
     describe ".moveToEndOfScreenLine()", ->
       describe "when soft wrap is on", ->
         it "moves cursor to the beginning of the screen line", ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(10)
           editor.setCursorScreenPosition([1, 2])
           editor.moveToEndOfScreenLine()
@@ -622,17 +670,18 @@ describe "TextEditor", ->
 
       describe "when soft wrap is off", ->
         it "moves cursor to the end of line", ->
-          editor.setCursorScreenPosition [0,0]
-          editor.addCursorAtScreenPosition [1,0]
+          editor.setCursorScreenPosition [0, 0]
+          editor.addCursorAtScreenPosition [1, 0]
           editor.moveToEndOfScreenLine()
           expect(editor.getCursors().length).toBe 2
           [cursor1, cursor2] = editor.getCursors()
-          expect(cursor1.getBufferPosition()).toEqual [0,29]
-          expect(cursor2.getBufferPosition()).toEqual [1,30]
+          expect(cursor1.getBufferPosition()).toEqual [0, 29]
+          expect(cursor2.getBufferPosition()).toEqual [1, 30]
 
     describe ".moveToBeginningOfLine()", ->
       it "moves cursor to the beginning of the buffer line", ->
         editor.setSoftWrapped(true)
+        editor.setDefaultCharWidth(1)
         editor.setEditorWidthInChars(10)
         editor.setCursorScreenPosition([1, 2])
         editor.moveToBeginningOfLine()
@@ -642,69 +691,71 @@ describe "TextEditor", ->
     describe ".moveToEndOfLine()", ->
       it "moves cursor to the end of the buffer line", ->
         editor.setSoftWrapped(true)
+        editor.setDefaultCharWidth(1)
         editor.setEditorWidthInChars(10)
         editor.setCursorScreenPosition([0, 2])
         editor.moveToEndOfLine()
         cursor = editor.getLastCursor()
-        expect(cursor.getScreenPosition()).toEqual [3, 4]
+        expect(cursor.getScreenPosition()).toEqual [4, 4]
 
     describe ".moveToFirstCharacterOfLine()", ->
       describe "when soft wrap is on", ->
         it "moves to the first character of the current screen line or the beginning of the screen line if it's already on the first character", ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(10)
-          editor.setCursorScreenPosition [2,5]
-          editor.addCursorAtScreenPosition [8,7]
+          editor.setCursorScreenPosition [2, 5]
+          editor.addCursorAtScreenPosition [8, 7]
 
           editor.moveToFirstCharacterOfLine()
           [cursor1, cursor2] = editor.getCursors()
-          expect(cursor1.getScreenPosition()).toEqual [2,0]
-          expect(cursor2.getScreenPosition()).toEqual [8,2]
+          expect(cursor1.getScreenPosition()).toEqual [2, 0]
+          expect(cursor2.getScreenPosition()).toEqual [8, 2]
 
           editor.moveToFirstCharacterOfLine()
-          expect(cursor1.getScreenPosition()).toEqual [2,0]
-          expect(cursor2.getScreenPosition()).toEqual [8,2]
+          expect(cursor1.getScreenPosition()).toEqual [2, 0]
+          expect(cursor2.getScreenPosition()).toEqual [8, 2]
 
       describe "when soft wrap is off", ->
         it "moves to the first character of the current line or the beginning of the line if it's already on the first character", ->
-          editor.setCursorScreenPosition [0,5]
-          editor.addCursorAtScreenPosition [1,7]
+          editor.setCursorScreenPosition [0, 5]
+          editor.addCursorAtScreenPosition [1, 7]
 
           editor.moveToFirstCharacterOfLine()
           [cursor1, cursor2] = editor.getCursors()
-          expect(cursor1.getBufferPosition()).toEqual [0,0]
-          expect(cursor2.getBufferPosition()).toEqual [1,2]
+          expect(cursor1.getBufferPosition()).toEqual [0, 0]
+          expect(cursor2.getBufferPosition()).toEqual [1, 2]
 
           editor.moveToFirstCharacterOfLine()
-          expect(cursor1.getBufferPosition()).toEqual [0,0]
-          expect(cursor2.getBufferPosition()).toEqual [1,0]
+          expect(cursor1.getBufferPosition()).toEqual [0, 0]
+          expect(cursor2.getBufferPosition()).toEqual [1, 0]
 
         it "moves to the beginning of the line if it only contains whitespace ", ->
           editor.setText("first\n    \nthird")
-          editor.setCursorScreenPosition [1,2]
+          editor.setCursorScreenPosition [1, 2]
           editor.moveToFirstCharacterOfLine()
           cursor = editor.getLastCursor()
-          expect(cursor.getBufferPosition()).toEqual [1,0]
+          expect(cursor.getBufferPosition()).toEqual [1, 0]
 
         describe "when invisible characters are enabled with soft tabs", ->
           it "moves to the first character of the current line without being confused by the invisible characters", ->
-            atom.config.set('editor.showInvisibles', true)
-            editor.setCursorScreenPosition [1,7]
+            editor.update({showInvisibles: true})
+            editor.setCursorScreenPosition [1, 7]
             editor.moveToFirstCharacterOfLine()
-            expect(editor.getCursorBufferPosition()).toEqual [1,2]
+            expect(editor.getCursorBufferPosition()).toEqual [1, 2]
             editor.moveToFirstCharacterOfLine()
-            expect(editor.getCursorBufferPosition()).toEqual [1,0]
+            expect(editor.getCursorBufferPosition()).toEqual [1, 0]
 
         describe "when invisible characters are enabled with hard tabs", ->
           it "moves to the first character of the current line without being confused by the invisible characters", ->
-            atom.config.set('editor.showInvisibles', true)
+            editor.update({showInvisibles: true})
             buffer.setTextInRange([[1, 0], [1, Infinity]], '\t\t\ta', normalizeLineEndings: false)
 
-            editor.setCursorScreenPosition [1,7]
+            editor.setCursorScreenPosition [1, 7]
             editor.moveToFirstCharacterOfLine()
-            expect(editor.getCursorBufferPosition()).toEqual [1,3]
+            expect(editor.getCursorBufferPosition()).toEqual [1, 3]
             editor.moveToFirstCharacterOfLine()
-            expect(editor.getCursorBufferPosition()).toEqual [1,0]
+            expect(editor.getCursorBufferPosition()).toEqual [1, 0]
 
     describe ".moveToBeginningOfWord()", ->
       it "moves the cursor to the beginning of the word", ->
@@ -728,10 +779,23 @@ describe "TextEditor", ->
         editor.moveToBeginningOfWord()
         expect(editor.getCursorBufferPosition()).toEqual [10, 0]
 
+      it "treats lines with only whitespace as a word (CRLF line ending)", ->
+        editor.buffer.setText(buffer.getText().replace(/\n/g, "\r\n"))
+        editor.setCursorBufferPosition([11, 0])
+        editor.moveToBeginningOfWord()
+        expect(editor.getCursorBufferPosition()).toEqual [10, 0]
+
       it "works when the current line is blank", ->
         editor.setCursorBufferPosition([10, 0])
         editor.moveToBeginningOfWord()
         expect(editor.getCursorBufferPosition()).toEqual [9, 2]
+
+      it "works when the current line is blank (CRLF line ending)", ->
+        editor.buffer.setText(buffer.getText().replace(/\n/g, "\r\n"))
+        editor.setCursorBufferPosition([10, 0])
+        editor.moveToBeginningOfWord()
+        expect(editor.getCursorBufferPosition()).toEqual [9, 2]
+        editor.buffer.setText(buffer.getText().replace(/\r\n/g, "\n"))
 
     describe ".moveToPreviousWordBoundary()", ->
       it "moves the cursor to the previous word boundary", ->
@@ -787,16 +851,28 @@ describe "TextEditor", ->
         editor.moveToEndOfWord()
         expect(editor.getCursorBufferPosition()).toEqual [10, 0]
 
+      it "treats lines with only whitespace as a word (CRLF line ending)", ->
+        editor.buffer.setText(buffer.getText().replace(/\n/g, "\r\n"))
+        editor.setCursorBufferPosition([9, 4])
+        editor.moveToEndOfWord()
+        expect(editor.getCursorBufferPosition()).toEqual [10, 0]
+
       it "works when the current line is blank", ->
+        editor.setCursorBufferPosition([10, 0])
+        editor.moveToEndOfWord()
+        expect(editor.getCursorBufferPosition()).toEqual [11, 8]
+
+      it "works when the current line is blank (CRLF line ending)", ->
+        editor.buffer.setText(buffer.getText().replace(/\n/g, "\r\n"))
         editor.setCursorBufferPosition([10, 0])
         editor.moveToEndOfWord()
         expect(editor.getCursorBufferPosition()).toEqual [11, 8]
 
     describe ".moveToBeginningOfNextWord()", ->
       it "moves the cursor before the first character of the next word", ->
-        editor.setCursorBufferPosition [0,6]
-        editor.addCursorAtBufferPosition [1,11]
-        editor.addCursorAtBufferPosition [2,0]
+        editor.setCursorBufferPosition [0, 6]
+        editor.addCursorAtBufferPosition [1, 11]
+        editor.addCursorAtBufferPosition [2, 0]
         [cursor1, cursor2, cursor3] = editor.getCursors()
 
         editor.moveToBeginningOfNextWord()
@@ -807,7 +883,7 @@ describe "TextEditor", ->
 
         # When the cursor is on whitespace
         editor.setText("ab cde- ")
-        editor.setCursorBufferPosition [0,2]
+        editor.setCursorBufferPosition [0, 2]
         cursor = editor.getLastCursor()
         editor.moveToBeginningOfNextWord()
 
@@ -829,6 +905,185 @@ describe "TextEditor", ->
         editor.moveToBeginningOfNextWord()
         expect(editor.getCursorBufferPosition()).toEqual [11, 9]
 
+    describe ".moveToPreviousSubwordBoundary", ->
+      it "does not move the cursor when there is no previous subword boundary", ->
+        editor.setText('')
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 0])
+
+      it "stops at word and underscore boundaries", ->
+        editor.setText("sub_word \n")
+        editor.setCursorBufferPosition([0, 9])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 8])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 0])
+
+        editor.setText(" word\n")
+        editor.setCursorBufferPosition([0, 3])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+      it "stops at camelCase boundaries", ->
+        editor.setText(" getPreviousWord\n")
+        editor.setCursorBufferPosition([0, 16])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 12])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+      it "skips consecutive non-word characters", ->
+        editor.setText("e, => \n")
+        editor.setCursorBufferPosition([0, 6])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 3])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+      it "skips consecutive uppercase characters", ->
+        editor.setText(" AAADF \n")
+        editor.setCursorBufferPosition([0, 7])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 6])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+        editor.setText("ALPhA\n")
+        editor.setCursorBufferPosition([0, 4])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 2])
+
+      it "skips consecutive numbers", ->
+        editor.setText(" 88 \n")
+        editor.setCursorBufferPosition([0, 4])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 3])
+
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+      it "works with multiple cursors", ->
+        editor.setText("curOp\ncursorOptions\n")
+        editor.setCursorBufferPosition([0, 8])
+        editor.addCursorAtBufferPosition([1, 13])
+        [cursor1, cursor2] = editor.getCursors()
+
+        editor.moveToPreviousSubwordBoundary()
+
+        expect(cursor1.getBufferPosition()).toEqual([0, 3])
+        expect(cursor2.getBufferPosition()).toEqual([1, 6])
+
+      it "works with non-English characters", ->
+        editor.setText("supåTøåst \n")
+        editor.setCursorBufferPosition([0, 9])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+        editor.setText("supaÖast \n")
+        editor.setCursorBufferPosition([0, 8])
+        editor.moveToPreviousSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+    describe ".moveToNextSubwordBoundary", ->
+      it "does not move the cursor when there is no next subword boundary", ->
+        editor.setText('')
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 0])
+
+      it "stops at word and underscore boundaries", ->
+        editor.setText(" sub_word \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 9])
+
+        editor.setText("word \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+      it "stops at camelCase boundaries", ->
+        editor.setText("getPreviousWord \n")
+        editor.setCursorBufferPosition([0, 0])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 3])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 11])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 15])
+
+      it "skips consecutive non-word characters", ->
+        editor.setText(", => \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+      it "skips consecutive uppercase characters", ->
+        editor.setText(" AAADF \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 6])
+
+        editor.setText("ALPhA\n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 2])
+
+      it "skips consecutive numbers", ->
+        editor.setText(" 88 \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 1])
+
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 3])
+
+      it "works with multiple cursors", ->
+        editor.setText("curOp\ncursorOptions\n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.addCursorAtBufferPosition([1, 0])
+        [cursor1, cursor2] = editor.getCursors()
+
+        editor.moveToNextSubwordBoundary()
+        expect(cursor1.getBufferPosition()).toEqual([0, 3])
+        expect(cursor2.getBufferPosition()).toEqual([1, 6])
+
+      it "works with non-English characters", ->
+        editor.setText("supåTøåst \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
+        editor.setText("supaÖast \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveToNextSubwordBoundary()
+        expect(editor.getCursorBufferPosition()).toEqual([0, 4])
+
     describe ".moveToBeginningOfNextParagraph()", ->
       it "moves the cursor before the first line of the next paragraph", ->
         editor.setCursorBufferPosition [0, 6]
@@ -842,8 +1097,36 @@ describe "TextEditor", ->
         editor.moveToBeginningOfNextParagraph()
         expect(editor.getCursorBufferPosition()).toEqual [0, 0]
 
+      it "moves the cursor before the first line of the next paragraph (CRLF line endings)", ->
+        editor.setText(editor.getText().replace(/\n/g, '\r\n'))
+
+        editor.setCursorBufferPosition [0, 6]
+        editor.foldBufferRow(4)
+
+        editor.moveToBeginningOfNextParagraph()
+        expect(editor.getCursorBufferPosition()).toEqual  [10, 0]
+
+        editor.setText("")
+        editor.setCursorBufferPosition [0, 0]
+        editor.moveToBeginningOfNextParagraph()
+        expect(editor.getCursorBufferPosition()).toEqual [0, 0]
+
     describe ".moveToBeginningOfPreviousParagraph()", ->
-      it "moves the cursor before the first line of the pevious paragraph", ->
+      it "moves the cursor before the first line of the previous paragraph", ->
+        editor.setCursorBufferPosition [10, 0]
+        editor.foldBufferRow(4)
+
+        editor.moveToBeginningOfPreviousParagraph()
+        expect(editor.getCursorBufferPosition()).toEqual [0, 0]
+
+        editor.setText("")
+        editor.setCursorBufferPosition [0, 0]
+        editor.moveToBeginningOfPreviousParagraph()
+        expect(editor.getCursorBufferPosition()).toEqual [0, 0]
+
+      it "moves the cursor before the first line of the previous paragraph (CRLF line endings)", ->
+        editor.setText(editor.getText().replace(/\n/g, '\r\n'))
+
         editor.setCursorBufferPosition [10, 0]
         editor.foldBufferRow(4)
 
@@ -885,6 +1168,64 @@ describe "TextEditor", ->
         editor.setCursorBufferPosition([3, 1])
         expect(editor.getCurrentParagraphBufferRange()).toBeUndefined()
 
+      it 'will limit paragraph range to comments', ->
+        waitsForPromise ->
+          atom.packages.activatePackage('language-javascript')
+
+        runs ->
+          editor.setGrammar(atom.grammars.grammarForScopeName('source.js'))
+          editor.setText("""
+            var quicksort = function () {
+              /* Single line comment block */
+              var sort = function(items) {};
+
+              /*
+              A multiline
+              comment is here
+              */
+              var sort = function(items) {};
+
+              // A comment
+              //
+              // Multiple comment
+              // lines
+              var sort = function(items) {};
+              // comment line after fn
+
+              var nosort = function(items) {
+                item;
+              }
+
+            };
+          """)
+
+          paragraphBufferRangeForRow = (row) ->
+            editor.setCursorBufferPosition([row, 0])
+            editor.getLastCursor().getCurrentParagraphBufferRange()
+
+          expect(paragraphBufferRangeForRow(0)).toEqual([[0, 0], [0, 29]])
+          expect(paragraphBufferRangeForRow(1)).toEqual([[1, 0], [1, 33]])
+          expect(paragraphBufferRangeForRow(2)).toEqual([[2, 0], [2, 32]])
+          expect(paragraphBufferRangeForRow(3)).toBeFalsy()
+          expect(paragraphBufferRangeForRow(4)).toEqual([[4, 0], [7, 4]])
+          expect(paragraphBufferRangeForRow(5)).toEqual([[4, 0], [7, 4]])
+          expect(paragraphBufferRangeForRow(6)).toEqual([[4, 0], [7, 4]])
+          expect(paragraphBufferRangeForRow(7)).toEqual([[4, 0], [7, 4]])
+          expect(paragraphBufferRangeForRow(8)).toEqual([[8, 0], [8, 32]])
+          expect(paragraphBufferRangeForRow(9)).toBeFalsy()
+          expect(paragraphBufferRangeForRow(10)).toEqual([[10, 0], [13, 10]])
+          expect(paragraphBufferRangeForRow(11)).toEqual([[10, 0], [13, 10]])
+          expect(paragraphBufferRangeForRow(12)).toEqual([[10, 0], [13, 10]])
+          expect(paragraphBufferRangeForRow(14)).toEqual([[14, 0], [14, 32]])
+          expect(paragraphBufferRangeForRow(15)).toEqual([[15, 0], [15, 26]])
+          expect(paragraphBufferRangeForRow(18)).toEqual([[17, 0], [19, 3]])
+
+    describe "getCursorAtScreenPosition(screenPosition)", ->
+      it "returns the cursor at the given screenPosition", ->
+        cursor1 = editor.addCursorAtScreenPosition([0, 2])
+        cursor2 = editor.getCursorAtScreenPosition(cursor1.getScreenPosition())
+        expect(cursor2).toBe cursor1
+
     describe "::getCursorScreenPositions()", ->
       it "returns the cursor positions in the order they were added", ->
         editor.foldBufferRow(4)
@@ -902,143 +1243,46 @@ describe "TextEditor", ->
     describe "addCursorAtScreenPosition(screenPosition)", ->
       describe "when a cursor already exists at the position", ->
         it "returns the existing cursor", ->
-          cursor1 = editor.addCursorAtScreenPosition([0,2])
-          cursor2 = editor.addCursorAtScreenPosition([0,2])
-          expect(cursor2.marker).toBe cursor1.marker
+          cursor1 = editor.addCursorAtScreenPosition([0, 2])
+          cursor2 = editor.addCursorAtScreenPosition([0, 2])
+          expect(cursor2).toBe cursor1
 
     describe "addCursorAtBufferPosition(bufferPosition)", ->
       describe "when a cursor already exists at the position", ->
         it "returns the existing cursor", ->
-          cursor1 = editor.addCursorAtBufferPosition([1,4])
-          cursor2 = editor.addCursorAtBufferPosition([1,4])
+          cursor1 = editor.addCursorAtBufferPosition([1, 4])
+          cursor2 = editor.addCursorAtBufferPosition([1, 4])
           expect(cursor2.marker).toBe cursor1.marker
 
-    describe "autoscroll", ->
-      beforeEach ->
-        editor.setVerticalScrollMargin(2)
-        editor.setHorizontalScrollMargin(2)
-        editor.setLineHeightInPixels(10)
-        editor.setDefaultCharWidth(10)
-        editor.setHorizontalScrollbarHeight(0)
-        editor.setHeight(5.5 * 10)
-        editor.setWidth(5.5 * 10)
-
-      it "scrolls down when the last cursor gets closer than ::verticalScrollMargin to the bottom of the editor", ->
-        expect(editor.getScrollTop()).toBe 0
-        expect(editor.getScrollBottom()).toBe 5.5 * 10
-
-        editor.setCursorScreenPosition([2, 0])
-        expect(editor.getScrollBottom()).toBe 5.5 * 10
-
-        editor.moveDown()
-        expect(editor.getScrollBottom()).toBe 6 * 10
-
-        editor.moveDown()
-        expect(editor.getScrollBottom()).toBe 7 * 10
-
-      it "scrolls up when the last cursor gets closer than ::verticalScrollMargin to the top of the editor", ->
-        editor.setCursorScreenPosition([11, 0])
-        editor.setScrollBottom(editor.getScrollHeight())
-
-        editor.moveUp()
-        expect(editor.getScrollBottom()).toBe editor.getScrollHeight()
-
-        editor.moveUp()
-        expect(editor.getScrollTop()).toBe 7 * 10
-
-        editor.moveUp()
-        expect(editor.getScrollTop()).toBe 6 * 10
-
-      it "scrolls right when the last cursor gets closer than ::horizontalScrollMargin to the right of the editor", ->
-        expect(editor.getScrollLeft()).toBe 0
-        expect(editor.getScrollRight()).toBe 5.5 * 10
-
-        editor.setCursorScreenPosition([0, 2])
-        expect(editor.getScrollRight()).toBe 5.5 * 10
-
-        editor.moveRight()
-        expect(editor.getScrollRight()).toBe 6 * 10
-
-        editor.moveRight()
-        expect(editor.getScrollRight()).toBe 7 * 10
-
-      it "scrolls left when the last cursor gets closer than ::horizontalScrollMargin to the left of the editor", ->
-        editor.setScrollRight(editor.getScrollWidth())
-        expect(editor.getScrollRight()).toBe editor.getScrollWidth()
-        editor.setCursorScreenPosition([6, 62], autoscroll: false)
-
-        editor.moveLeft()
-        expect(editor.getScrollLeft()).toBe 59 * 10
-
-        editor.moveLeft()
-        expect(editor.getScrollLeft()).toBe 58 * 10
-
-      it "scrolls down when inserting lines makes the document longer than the editor's height", ->
-        editor.setCursorScreenPosition([13, Infinity])
-        editor.insertNewline()
-        expect(editor.getScrollBottom()).toBe 14 * 10
-        editor.insertNewline()
-        expect(editor.getScrollBottom()).toBe 15 * 10
-
-      it "autoscrolls to the cursor when it moves due to undo", ->
-        editor.insertText('abc')
-        editor.setScrollTop(Infinity)
-        editor.undo()
-        expect(editor.getScrollTop()).toBe 0
-
-      it "doesn't scroll when the cursor moves into the visible area", ->
-        editor.setCursorBufferPosition([0, 0])
-        editor.setScrollTop(40)
-        expect(editor.getVisibleRowRange()).toEqual([4, 9])
-        editor.setCursorBufferPosition([6, 0])
-        expect(editor.getScrollTop()).toBe 40
-
-      it "honors the autoscroll option on cursor and selection manipulation methods", ->
-        expect(editor.getScrollTop()).toBe 0
-        editor.addCursorAtScreenPosition([11, 11], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.addCursorAtBufferPosition([11, 11], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.setCursorScreenPosition([11, 11], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.setCursorBufferPosition([11, 11], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.addSelectionForBufferRange([[11, 11], [11, 11]], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.addSelectionForScreenRange([[11, 11], [11, 12]], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.setSelectedBufferRange([[11, 0], [11, 1]], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.setSelectedScreenRange([[11, 0], [11, 6]], autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-        editor.clearSelections(autoscroll: false)
-        expect(editor.getScrollTop()).toBe 0
-
-        editor.addSelectionForScreenRange([[0, 0], [0, 4]])
-
-        editor.getCursors()[0].setScreenPosition([11, 11], autoscroll: true)
-        expect(editor.getScrollTop()).toBeGreaterThan 0
-        editor.getCursors()[0].setBufferPosition([0, 0], autoscroll: true)
-        expect(editor.getScrollTop()).toBe 0
-        editor.getSelections()[0].setScreenRange([[11, 0], [11, 4]], autoscroll: true)
-        expect(editor.getScrollTop()).toBeGreaterThan 0
-        editor.getSelections()[0].setBufferRange([[0, 0], [0, 4]], autoscroll: true)
-        expect(editor.getScrollTop()).toBe 0
-
-    describe '.logCursorScope()', ->
-      beforeEach ->
-        spyOn(atom.notifications, 'addInfo')
-
-      it 'opens a notification', ->
-        editor.logCursorScope()
-
-        expect(atom.notifications.addInfo).toHaveBeenCalled()
+    describe '.getCursorScope()', ->
+      it 'returns the current scope', ->
+        descriptor = editor.getCursorScope()
+        expect(descriptor.scopes).toContain('source.js')
 
   describe "selection", ->
     selection = null
 
     beforeEach ->
       selection = editor.getLastSelection()
+
+    describe ".getLastSelection()", ->
+      it "creates a new selection at (0, 0) if the last selection has been destroyed", ->
+        editor.getLastSelection().destroy()
+        expect(editor.getLastSelection().getBufferRange()).toEqual([[0, 0], [0, 0]])
+
+      it "doesn't get stuck in a infinite loop when called from ::onDidAddCursor after the last selection has been destroyed (regression)", ->
+        callCount = 0
+        editor.getLastSelection().destroy()
+        editor.onDidAddCursor (cursor) ->
+          callCount++
+          editor.getLastSelection()
+        expect(editor.getLastSelection().getBufferRange()).toEqual([[0, 0], [0, 0]])
+        expect(callCount).toBe(1)
+
+    describe ".getSelections()", ->
+      it "creates a new selection at (0, 0) if the last selection has been destroyed", ->
+        editor.getLastSelection().destroy()
+        expect(editor.getSelections()[0].getBufferRange()).toEqual([[0, 0], [0, 0]])
 
     describe "when the selection range changes", ->
       it "emits an event with the old range, new range, and the selection that moved", ->
@@ -1058,28 +1302,28 @@ describe "TextEditor", ->
 
     describe ".selectUp/Down/Left/Right()", ->
       it "expands each selection to its cursor's new location", ->
-        editor.setSelectedBufferRanges([[[0,9], [0,13]], [[3,16], [3,21]]])
+        editor.setSelectedBufferRanges([[[0, 9], [0, 13]], [[3, 16], [3, 21]]])
         [selection1, selection2] = editor.getSelections()
 
         editor.selectRight()
-        expect(selection1.getBufferRange()).toEqual [[0,9], [0,14]]
-        expect(selection2.getBufferRange()).toEqual [[3,16], [3,22]]
+        expect(selection1.getBufferRange()).toEqual [[0, 9], [0, 14]]
+        expect(selection2.getBufferRange()).toEqual [[3, 16], [3, 22]]
 
         editor.selectLeft()
         editor.selectLeft()
-        expect(selection1.getBufferRange()).toEqual [[0,9], [0,12]]
-        expect(selection2.getBufferRange()).toEqual [[3,16], [3,20]]
+        expect(selection1.getBufferRange()).toEqual [[0, 9], [0, 12]]
+        expect(selection2.getBufferRange()).toEqual [[3, 16], [3, 20]]
 
         editor.selectDown()
-        expect(selection1.getBufferRange()).toEqual [[0,9], [1,12]]
-        expect(selection2.getBufferRange()).toEqual [[3,16], [4,20]]
+        expect(selection1.getBufferRange()).toEqual [[0, 9], [1, 12]]
+        expect(selection2.getBufferRange()).toEqual [[3, 16], [4, 20]]
 
         editor.selectUp()
-        expect(selection1.getBufferRange()).toEqual [[0,9], [0,12]]
-        expect(selection2.getBufferRange()).toEqual [[3,16], [3,20]]
+        expect(selection1.getBufferRange()).toEqual [[0, 9], [0, 12]]
+        expect(selection2.getBufferRange()).toEqual [[3, 16], [3, 20]]
 
       it "merges selections when they intersect when moving down", ->
-        editor.setSelectedBufferRanges([[[0,9], [0,13]], [[1,10], [1,20]], [[2,15], [3,25]]])
+        editor.setSelectedBufferRanges([[[0, 9], [0, 13]], [[1, 10], [1, 20]], [[2, 15], [3, 25]]])
         [selection1, selection2, selection3] = editor.getSelections()
 
         editor.selectDown()
@@ -1088,7 +1332,7 @@ describe "TextEditor", ->
         expect(selection1.isReversed()).toBeFalsy()
 
       it "merges selections when they intersect when moving up", ->
-        editor.setSelectedBufferRanges([[[0,9], [0,13]], [[1,10], [1,20]]], reversed: true)
+        editor.setSelectedBufferRanges([[[0, 9], [0, 13]], [[1, 10], [1, 20]]], reversed: true)
         [selection1, selection2] = editor.getSelections()
 
         editor.selectUp()
@@ -1098,7 +1342,7 @@ describe "TextEditor", ->
         expect(selection1.isReversed()).toBeTruthy()
 
       it "merges selections when they intersect when moving left", ->
-        editor.setSelectedBufferRanges([[[0,9], [0,13]], [[0,13], [1,20]]], reversed: true)
+        editor.setSelectedBufferRanges([[[0, 9], [0, 13]], [[0, 13], [1, 20]]], reversed: true)
         [selection1, selection2] = editor.getSelections()
 
         editor.selectLeft()
@@ -1107,7 +1351,7 @@ describe "TextEditor", ->
         expect(selection1.isReversed()).toBeTruthy()
 
       it "merges selections when they intersect when moving right", ->
-        editor.setSelectedBufferRanges([[[0,9], [0,14]], [[0,14], [1,20]]])
+        editor.setSelectedBufferRanges([[[0, 9], [0, 14]], [[0, 14], [1, 20]]])
         [selection1, selection2] = editor.getSelections()
 
         editor.selectRight()
@@ -1117,24 +1361,24 @@ describe "TextEditor", ->
 
       describe "when counts are passed into the selection functions", ->
         it "expands each selection to its cursor's new location", ->
-          editor.setSelectedBufferRanges([[[0,9], [0,13]], [[3,16], [3,21]]])
+          editor.setSelectedBufferRanges([[[0, 9], [0, 13]], [[3, 16], [3, 21]]])
           [selection1, selection2] = editor.getSelections()
 
           editor.selectRight(2)
-          expect(selection1.getBufferRange()).toEqual [[0,9], [0,15]]
-          expect(selection2.getBufferRange()).toEqual [[3,16], [3,23]]
+          expect(selection1.getBufferRange()).toEqual [[0, 9], [0, 15]]
+          expect(selection2.getBufferRange()).toEqual [[3, 16], [3, 23]]
 
           editor.selectLeft(3)
-          expect(selection1.getBufferRange()).toEqual [[0,9], [0,12]]
-          expect(selection2.getBufferRange()).toEqual [[3,16], [3,20]]
+          expect(selection1.getBufferRange()).toEqual [[0, 9], [0, 12]]
+          expect(selection2.getBufferRange()).toEqual [[3, 16], [3, 20]]
 
           editor.selectDown(3)
-          expect(selection1.getBufferRange()).toEqual [[0,9], [3,12]]
-          expect(selection2.getBufferRange()).toEqual [[3,16], [6,20]]
+          expect(selection1.getBufferRange()).toEqual [[0, 9], [3, 12]]
+          expect(selection2.getBufferRange()).toEqual [[3, 16], [6, 20]]
 
           editor.selectUp(2)
-          expect(selection1.getBufferRange()).toEqual [[0,9], [1,12]]
-          expect(selection2.getBufferRange()).toEqual [[3,16], [4,20]]
+          expect(selection1.getBufferRange()).toEqual [[0, 9], [1, 12]]
+          expect(selection2.getBufferRange()).toEqual [[3, 16], [4, 20]]
 
     describe ".selectToBufferPosition(bufferPosition)", ->
       it "expands the last selection to the given position", ->
@@ -1160,6 +1404,15 @@ describe "TextEditor", ->
         expect(selection1.getScreenRange()).toEqual [[3, 0], [4, 5]]
         expect(selection2.getScreenRange()).toEqual [[5, 6], [6, 2]]
 
+      describe "when selecting with an initial screen range", ->
+        it "switches the direction of the selection when selecting to positions before/after the start of the initial range", ->
+          editor.setCursorScreenPosition([5, 10])
+          editor.selectWordsContainingCursors()
+          editor.selectToScreenPosition([3, 0])
+          expect(editor.getLastSelection().isReversed()).toBe true
+          editor.selectToScreenPosition([9, 0])
+          expect(editor.getLastSelection().isReversed()).toBe false
+
     describe ".selectToBeginningOfNextParagraph()", ->
       it "selects from the cursor to first line of the next paragraph", ->
         editor.setSelectedBufferRange([[3, 0], [4, 5]])
@@ -1173,7 +1426,7 @@ describe "TextEditor", ->
         expect(selections[0].getScreenRange()).toEqual [[3, 0], [10, 0]]
 
     describe ".selectToBeginningOfPreviousParagraph()", ->
-      it "selects from the cursor to the first line of the pevious paragraph", ->
+      it "selects from the cursor to the first line of the previous paragraph", ->
         editor.setSelectedBufferRange([[3, 0], [4, 5]])
         editor.addCursorAtScreenPosition([5, 6])
         editor.selectToScreenPosition([6, 2])
@@ -1206,23 +1459,23 @@ describe "TextEditor", ->
         expect(selection1.isReversed()).toBeTruthy()
 
     describe ".selectToTop()", ->
-      it "selects text from cusor position to the top of the buffer", ->
-        editor.setCursorScreenPosition [11,2]
-        editor.addCursorAtScreenPosition [10,0]
+      it "selects text from cursor position to the top of the buffer", ->
+        editor.setCursorScreenPosition [11, 2]
+        editor.addCursorAtScreenPosition [10, 0]
         editor.selectToTop()
         expect(editor.getCursors().length).toBe 1
-        expect(editor.getCursorBufferPosition()).toEqual [0,0]
-        expect(editor.getLastSelection().getBufferRange()).toEqual [[0,0], [11,2]]
+        expect(editor.getCursorBufferPosition()).toEqual [0, 0]
+        expect(editor.getLastSelection().getBufferRange()).toEqual [[0, 0], [11, 2]]
         expect(editor.getLastSelection().isReversed()).toBeTruthy()
 
     describe ".selectToBottom()", ->
-      it "selects text from cusor position to the bottom of the buffer", ->
-        editor.setCursorScreenPosition [10,0]
-        editor.addCursorAtScreenPosition [9,3]
+      it "selects text from cursor position to the bottom of the buffer", ->
+        editor.setCursorScreenPosition [10, 0]
+        editor.addCursorAtScreenPosition [9, 3]
         editor.selectToBottom()
         expect(editor.getCursors().length).toBe 1
-        expect(editor.getCursorBufferPosition()).toEqual [12,2]
-        expect(editor.getLastSelection().getBufferRange()).toEqual [[9,3], [12,2]]
+        expect(editor.getCursorBufferPosition()).toEqual [12, 2]
+        expect(editor.getLastSelection().getBufferRange()).toEqual [[9, 3], [12, 2]]
         expect(editor.getLastSelection().isReversed()).toBeFalsy()
 
     describe ".selectAll()", ->
@@ -1231,128 +1484,121 @@ describe "TextEditor", ->
         expect(editor.getLastSelection().getBufferRange()).toEqual buffer.getRange()
 
     describe ".selectToBeginningOfLine()", ->
-      it "selects text from cusor position to beginning of line", ->
-        editor.setCursorScreenPosition [12,2]
-        editor.addCursorAtScreenPosition [11,3]
+      it "selects text from cursor position to beginning of line", ->
+        editor.setCursorScreenPosition [12, 2]
+        editor.addCursorAtScreenPosition [11, 3]
 
         editor.selectToBeginningOfLine()
 
         expect(editor.getCursors().length).toBe 2
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [12,0]
-        expect(cursor2.getBufferPosition()).toEqual [11,0]
+        expect(cursor1.getBufferPosition()).toEqual [12, 0]
+        expect(cursor2.getBufferPosition()).toEqual [11, 0]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[12,0], [12,2]]
+        expect(selection1.getBufferRange()).toEqual [[12, 0], [12, 2]]
         expect(selection1.isReversed()).toBeTruthy()
-        expect(selection2.getBufferRange()).toEqual [[11,0], [11,3]]
+        expect(selection2.getBufferRange()).toEqual [[11, 0], [11, 3]]
         expect(selection2.isReversed()).toBeTruthy()
 
     describe ".selectToEndOfLine()", ->
-      it "selects text from cusor position to end of line", ->
-        editor.setCursorScreenPosition [12,0]
-        editor.addCursorAtScreenPosition [11,3]
+      it "selects text from cursor position to end of line", ->
+        editor.setCursorScreenPosition [12, 0]
+        editor.addCursorAtScreenPosition [11, 3]
 
         editor.selectToEndOfLine()
 
         expect(editor.getCursors().length).toBe 2
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [12,2]
-        expect(cursor2.getBufferPosition()).toEqual [11,44]
+        expect(cursor1.getBufferPosition()).toEqual [12, 2]
+        expect(cursor2.getBufferPosition()).toEqual [11, 44]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[12,0], [12,2]]
+        expect(selection1.getBufferRange()).toEqual [[12, 0], [12, 2]]
         expect(selection1.isReversed()).toBeFalsy()
-        expect(selection2.getBufferRange()).toEqual [[11,3], [11,44]]
+        expect(selection2.getBufferRange()).toEqual [[11, 3], [11, 44]]
         expect(selection2.isReversed()).toBeFalsy()
 
     describe ".selectLinesContainingCursors()", ->
-      it "selects the entire line (including newlines) at given row", ->
+      it "selects to the entire line (including newlines) at given row", ->
         editor.setCursorScreenPosition([1, 2])
         editor.selectLinesContainingCursors()
-        expect(editor.getSelectedBufferRange()).toEqual [[1,0], [2,0]]
+        expect(editor.getSelectedBufferRange()).toEqual [[1, 0], [2, 0]]
         expect(editor.getSelectedText()).toBe "  var sort = function(items) {\n"
 
         editor.setCursorScreenPosition([12, 2])
         editor.selectLinesContainingCursors()
-        expect(editor.getSelectedBufferRange()).toEqual [[12,0], [12,2]]
+        expect(editor.getSelectedBufferRange()).toEqual [[12, 0], [12, 2]]
 
         editor.setCursorBufferPosition([0, 2])
         editor.selectLinesContainingCursors()
         editor.selectLinesContainingCursors()
-        expect(editor.getSelectedBufferRange()).toEqual [[0,0], [2,0]]
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 0], [2, 0]]
 
-      it "autoscrolls to the selection", ->
-        editor.setLineHeightInPixels(10)
-        editor.setDefaultCharWidth(10)
-        editor.setHeight(50)
-        editor.setWidth(50)
-        editor.setHorizontalScrollbarHeight(0)
-        editor.setCursorScreenPosition([5, 6])
-
-        editor.scrollToTop()
-        expect(editor.getScrollTop()).toBe 0
-
-        editor.selectLinesContainingCursors()
-        expect(editor.getScrollBottom()).toBe (7 + editor.getVerticalScrollMargin()) * 10
+      describe "when the selection spans multiple row", ->
+        it "selects from the beginning of the first line to the last line", ->
+          selection = editor.getLastSelection()
+          selection.setBufferRange [[1, 10], [3, 20]]
+          editor.selectLinesContainingCursors()
+          expect(editor.getSelectedBufferRange()).toEqual [[1, 0], [4, 0]]
 
     describe ".selectToBeginningOfWord()", ->
-      it "selects text from cusor position to beginning of word", ->
-        editor.setCursorScreenPosition [0,13]
-        editor.addCursorAtScreenPosition [3,49]
+      it "selects text from cursor position to beginning of word", ->
+        editor.setCursorScreenPosition [0, 13]
+        editor.addCursorAtScreenPosition [3, 49]
 
         editor.selectToBeginningOfWord()
 
         expect(editor.getCursors().length).toBe 2
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [0,4]
-        expect(cursor2.getBufferPosition()).toEqual [3,47]
+        expect(cursor1.getBufferPosition()).toEqual [0, 4]
+        expect(cursor2.getBufferPosition()).toEqual [3, 47]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,4], [0,13]]
+        expect(selection1.getBufferRange()).toEqual [[0, 4], [0, 13]]
         expect(selection1.isReversed()).toBeTruthy()
-        expect(selection2.getBufferRange()).toEqual [[3,47], [3,49]]
+        expect(selection2.getBufferRange()).toEqual [[3, 47], [3, 49]]
         expect(selection2.isReversed()).toBeTruthy()
 
     describe ".selectToEndOfWord()", ->
-      it "selects text from cusor position to end of word", ->
-        editor.setCursorScreenPosition [0,4]
-        editor.addCursorAtScreenPosition [3,48]
+      it "selects text from cursor position to end of word", ->
+        editor.setCursorScreenPosition [0, 4]
+        editor.addCursorAtScreenPosition [3, 48]
 
         editor.selectToEndOfWord()
 
         expect(editor.getCursors().length).toBe 2
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [0,13]
-        expect(cursor2.getBufferPosition()).toEqual [3,50]
+        expect(cursor1.getBufferPosition()).toEqual [0, 13]
+        expect(cursor2.getBufferPosition()).toEqual [3, 50]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,4], [0,13]]
+        expect(selection1.getBufferRange()).toEqual [[0, 4], [0, 13]]
         expect(selection1.isReversed()).toBeFalsy()
-        expect(selection2.getBufferRange()).toEqual [[3,48], [3,50]]
+        expect(selection2.getBufferRange()).toEqual [[3, 48], [3, 50]]
         expect(selection2.isReversed()).toBeFalsy()
 
     describe ".selectToBeginningOfNextWord()", ->
-      it "selects text from cusor position to beginning of next word", ->
-        editor.setCursorScreenPosition [0,4]
-        editor.addCursorAtScreenPosition [3,48]
+      it "selects text from cursor position to beginning of next word", ->
+        editor.setCursorScreenPosition [0, 4]
+        editor.addCursorAtScreenPosition [3, 48]
 
         editor.selectToBeginningOfNextWord()
 
         expect(editor.getCursors().length).toBe 2
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [0,14]
-        expect(cursor2.getBufferPosition()).toEqual [3,51]
+        expect(cursor1.getBufferPosition()).toEqual [0, 14]
+        expect(cursor2.getBufferPosition()).toEqual [3, 51]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,4], [0,14]]
+        expect(selection1.getBufferRange()).toEqual [[0, 4], [0, 14]]
         expect(selection1.isReversed()).toBeFalsy()
-        expect(selection2.getBufferRange()).toEqual [[3,48], [3,51]]
+        expect(selection2.getBufferRange()).toEqual [[3, 48], [3, 51]]
         expect(selection2.isReversed()).toBeFalsy()
 
     describe ".selectToPreviousWordBoundary()", ->
@@ -1366,13 +1612,13 @@ describe "TextEditor", ->
 
         expect(editor.getSelections().length).toBe 4
         [selection1, selection2, selection3, selection4] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,8], [0,4]]
+        expect(selection1.getBufferRange()).toEqual [[0, 8], [0, 4]]
         expect(selection1.isReversed()).toBeTruthy()
-        expect(selection2.getBufferRange()).toEqual [[2,0], [1,30]]
+        expect(selection2.getBufferRange()).toEqual [[2, 0], [1, 30]]
         expect(selection2.isReversed()).toBeTruthy()
-        expect(selection3.getBufferRange()).toEqual [[3,4], [3,0]]
+        expect(selection3.getBufferRange()).toEqual [[3, 4], [3, 0]]
         expect(selection3.isReversed()).toBeTruthy()
-        expect(selection4.getBufferRange()).toEqual [[3,14], [3,13]]
+        expect(selection4.getBufferRange()).toEqual [[3, 14], [3, 13]]
         expect(selection4.isReversed()).toBeTruthy()
 
     describe ".selectToNextWordBoundary()", ->
@@ -1386,14 +1632,136 @@ describe "TextEditor", ->
 
         expect(editor.getSelections().length).toBe 4
         [selection1, selection2, selection3, selection4] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,8], [0,13]]
+        expect(selection1.getBufferRange()).toEqual [[0, 8], [0, 13]]
         expect(selection1.isReversed()).toBeFalsy()
-        expect(selection2.getBufferRange()).toEqual [[2,40], [3,0]]
+        expect(selection2.getBufferRange()).toEqual [[2, 40], [3, 0]]
         expect(selection2.isReversed()).toBeFalsy()
-        expect(selection3.getBufferRange()).toEqual [[4,0], [4,4]]
+        expect(selection3.getBufferRange()).toEqual [[4, 0], [4, 4]]
         expect(selection3.isReversed()).toBeFalsy()
-        expect(selection4.getBufferRange()).toEqual [[3,30], [3,31]]
+        expect(selection4.getBufferRange()).toEqual [[3, 30], [3, 31]]
         expect(selection4.isReversed()).toBeFalsy()
+
+    describe ".selectToPreviousSubwordBoundary", ->
+      it "selects subwords", ->
+        editor.setText("")
+        editor.insertText("_word\n")
+        editor.insertText(" getPreviousWord\n")
+        editor.insertText("e, => \n")
+        editor.insertText(" 88 \n")
+        editor.setCursorBufferPosition([0, 5])
+        editor.addCursorAtBufferPosition([1, 7])
+        editor.addCursorAtBufferPosition([2, 5])
+        editor.addCursorAtBufferPosition([3, 3])
+        [selection1, selection2, selection3, selection4] = editor.getSelections()
+
+        editor.selectToPreviousSubwordBoundary()
+        expect(selection1.getBufferRange()).toEqual([[0, 1], [0, 5]])
+        expect(selection1.isReversed()).toBeTruthy()
+        expect(selection2.getBufferRange()).toEqual([[1, 4], [1, 7]])
+        expect(selection2.isReversed()).toBeTruthy()
+        expect(selection3.getBufferRange()).toEqual([[2, 3], [2, 5]])
+        expect(selection3.isReversed()).toBeTruthy()
+        expect(selection4.getBufferRange()).toEqual([[3, 1], [3, 3]])
+        expect(selection4.isReversed()).toBeTruthy()
+
+    describe ".selectToNextSubwordBoundary", ->
+      it "selects subwords", ->
+        editor.setText("")
+        editor.insertText("word_\n")
+        editor.insertText("getPreviousWord\n")
+        editor.insertText("e, => \n")
+        editor.insertText(" 88 \n")
+        editor.setCursorBufferPosition([0, 1])
+        editor.addCursorAtBufferPosition([1, 7])
+        editor.addCursorAtBufferPosition([2, 2])
+        editor.addCursorAtBufferPosition([3, 1])
+        [selection1, selection2, selection3, selection4] = editor.getSelections()
+
+        editor.selectToNextSubwordBoundary()
+        expect(selection1.getBufferRange()).toEqual([[0, 1], [0, 4]])
+        expect(selection1.isReversed()).toBeFalsy()
+        expect(selection2.getBufferRange()).toEqual([[1, 7], [1, 11]])
+        expect(selection2.isReversed()).toBeFalsy()
+        expect(selection3.getBufferRange()).toEqual([[2, 2], [2, 5]])
+        expect(selection3.isReversed()).toBeFalsy()
+        expect(selection4.getBufferRange()).toEqual([[3, 1], [3, 3]])
+        expect(selection4.isReversed()).toBeFalsy()
+
+    describe ".deleteToBeginningOfSubword", ->
+      it "deletes subwords", ->
+        editor.setText("")
+        editor.insertText("_word\n")
+        editor.insertText(" getPreviousWord\n")
+        editor.insertText("e, => \n")
+        editor.insertText(" 88 \n")
+        editor.setCursorBufferPosition([0, 5])
+        editor.addCursorAtBufferPosition([1, 7])
+        editor.addCursorAtBufferPosition([2, 5])
+        editor.addCursorAtBufferPosition([3, 3])
+        [cursor1, cursor2, cursor3, cursor4] = editor.getCursors()
+
+        editor.deleteToBeginningOfSubword()
+        expect(buffer.lineForRow(0)).toBe('_')
+        expect(buffer.lineForRow(1)).toBe(' getviousWord')
+        expect(buffer.lineForRow(2)).toBe('e,  ')
+        expect(buffer.lineForRow(3)).toBe('  ')
+        expect(cursor1.getBufferPosition()).toEqual([0, 1])
+        expect(cursor2.getBufferPosition()).toEqual([1, 4])
+        expect(cursor3.getBufferPosition()).toEqual([2, 3])
+        expect(cursor4.getBufferPosition()).toEqual([3, 1])
+
+        editor.deleteToBeginningOfSubword()
+        expect(buffer.lineForRow(0)).toBe('')
+        expect(buffer.lineForRow(1)).toBe(' viousWord')
+        expect(buffer.lineForRow(2)).toBe('e ')
+        expect(buffer.lineForRow(3)).toBe(' ')
+        expect(cursor1.getBufferPosition()).toEqual([0, 0])
+        expect(cursor2.getBufferPosition()).toEqual([1, 1])
+        expect(cursor3.getBufferPosition()).toEqual([2, 1])
+        expect(cursor4.getBufferPosition()).toEqual([3, 0])
+
+        editor.deleteToBeginningOfSubword()
+        expect(buffer.lineForRow(0)).toBe('')
+        expect(buffer.lineForRow(1)).toBe('viousWord')
+        expect(buffer.lineForRow(2)).toBe('  ')
+        expect(buffer.lineForRow(3)).toBe('')
+        expect(cursor1.getBufferPosition()).toEqual([0, 0])
+        expect(cursor2.getBufferPosition()).toEqual([1, 0])
+        expect(cursor3.getBufferPosition()).toEqual([2, 0])
+        expect(cursor4.getBufferPosition()).toEqual([2, 1])
+
+    describe ".deleteToEndOfSubword", ->
+      it "deletes subwords", ->
+        editor.setText("")
+        editor.insertText("word_\n")
+        editor.insertText("getPreviousWord \n")
+        editor.insertText("e, => \n")
+        editor.insertText(" 88 \n")
+        editor.setCursorBufferPosition([0, 0])
+        editor.addCursorAtBufferPosition([1, 0])
+        editor.addCursorAtBufferPosition([2, 2])
+        editor.addCursorAtBufferPosition([3, 0])
+        [cursor1, cursor2, cursor3, cursor4] = editor.getCursors()
+
+        editor.deleteToEndOfSubword()
+        expect(buffer.lineForRow(0)).toBe('_')
+        expect(buffer.lineForRow(1)).toBe('PreviousWord ')
+        expect(buffer.lineForRow(2)).toBe('e, ')
+        expect(buffer.lineForRow(3)).toBe('88 ')
+        expect(cursor1.getBufferPosition()).toEqual([0, 0])
+        expect(cursor2.getBufferPosition()).toEqual([1, 0])
+        expect(cursor3.getBufferPosition()).toEqual([2, 2])
+        expect(cursor4.getBufferPosition()).toEqual([3, 0])
+
+        editor.deleteToEndOfSubword()
+        expect(buffer.lineForRow(0)).toBe('')
+        expect(buffer.lineForRow(1)).toBe('Word ')
+        expect(buffer.lineForRow(2)).toBe('e,')
+        expect(buffer.lineForRow(3)).toBe(' ')
+        expect(cursor1.getBufferPosition()).toEqual([0, 0])
+        expect(cursor2.getBufferPosition()).toEqual([1, 0])
+        expect(cursor3.getBufferPosition()).toEqual([2, 2])
+        expect(cursor4.getBufferPosition()).toEqual([3, 0])
 
     describe ".selectWordsContainingCursors()", ->
       describe "when the cursor is inside a word", ->
@@ -1429,52 +1797,53 @@ describe "TextEditor", ->
           editor.selectWordsContainingCursors()
           expect(editor.getSelectedBufferRange()).toEqual [[12, 2], [12, 6]]
 
-      describe 'when editor.nonWordCharacters is set scoped to a grammar', ->
-        coffeeEditor = null
-        beforeEach ->
-          waitsForPromise ->
-            atom.packages.activatePackage('language-coffee-script')
-          waitsForPromise ->
-            atom.project.open('coffee.coffee', autoIndent: false).then (o) -> coffeeEditor = o
+      it "selects words based on the non-word characters configured at the cursor's current scope", ->
+        editor.setText("one-one; 'two-two'; three-three")
 
-        it 'selects the correct surrounding word for the given scoped setting', ->
-          coffeeEditor.setCursorBufferPosition [0, 9] # in the middle of quicksort
-          coffeeEditor.selectWordsContainingCursors()
-          expect(coffeeEditor.getSelectedBufferRange()).toEqual [[0, 6], [0, 15]]
+        editor.setCursorBufferPosition([0, 1])
+        editor.addCursorAtBufferPosition([0, 12])
 
-          atom.config.set 'editor.nonWordCharacters', 'qusort', scopeSelector: '.source.coffee'
+        scopeDescriptors = editor.getCursors().map (c) -> c.getScopeDescriptor()
+        expect(scopeDescriptors[0].getScopesArray()).toEqual(['source.js'])
+        expect(scopeDescriptors[1].getScopesArray()).toEqual(['source.js', 'string.quoted.single.js'])
 
-          coffeeEditor.setCursorBufferPosition [0, 9]
-          coffeeEditor.selectWordsContainingCursors()
-          expect(coffeeEditor.getSelectedBufferRange()).toEqual [[0, 8], [0, 11]]
+        editor.setScopedSettingsDelegate({
+          getNonWordCharacters: (scopes) ->
+            result = '/\()"\':,.;<>~!@#$%^&*|+=[]{}`?'
+            if (scopes.some (scope) -> scope.startsWith('string'))
+              result
+            else
+              result + '-'
+        })
 
-          editor.setCursorBufferPosition [0, 7]
-          editor.selectWordsContainingCursors()
-          expect(editor.getSelectedBufferRange()).toEqual [[0, 4], [0, 13]]
+        editor.selectWordsContainingCursors()
+
+        expect(editor.getSelections()[0].getText()).toBe('one')
+        expect(editor.getSelections()[1].getText()).toBe('two-two')
 
     describe ".selectToFirstCharacterOfLine()", ->
       it "moves to the first character of the current line or the beginning of the line if it's already on the first character", ->
-        editor.setCursorScreenPosition [0,5]
-        editor.addCursorAtScreenPosition [1,7]
+        editor.setCursorScreenPosition [0, 5]
+        editor.addCursorAtScreenPosition [1, 7]
 
         editor.selectToFirstCharacterOfLine()
 
         [cursor1, cursor2] = editor.getCursors()
-        expect(cursor1.getBufferPosition()).toEqual [0,0]
-        expect(cursor2.getBufferPosition()).toEqual [1,2]
+        expect(cursor1.getBufferPosition()).toEqual [0, 0]
+        expect(cursor2.getBufferPosition()).toEqual [1, 2]
 
         expect(editor.getSelections().length).toBe 2
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,0], [0,5]]
+        expect(selection1.getBufferRange()).toEqual [[0, 0], [0, 5]]
         expect(selection1.isReversed()).toBeTruthy()
-        expect(selection2.getBufferRange()).toEqual [[1,2], [1,7]]
+        expect(selection2.getBufferRange()).toEqual [[1, 2], [1, 7]]
         expect(selection2.isReversed()).toBeTruthy()
 
         editor.selectToFirstCharacterOfLine()
         [selection1, selection2] = editor.getSelections()
-        expect(selection1.getBufferRange()).toEqual [[0,0], [0,5]]
+        expect(selection1.getBufferRange()).toEqual [[0, 0], [0, 5]]
         expect(selection1.isReversed()).toBeTruthy()
-        expect(selection2.getBufferRange()).toEqual [[1,0], [1,7]]
+        expect(selection2.getBufferRange()).toEqual [[1, 0], [1, 7]]
         expect(selection2.isReversed()).toBeTruthy()
 
     describe ".setSelectedBufferRanges(ranges)", ->
@@ -1493,7 +1862,7 @@ describe "TextEditor", ->
         editor.setSelectedBufferRanges([[[2, 2], [3, 3]], [[3, 3], [5, 5]]])
         expect(editor.getSelectedBufferRanges()).toEqual [[[2, 2], [3, 3]], [[3, 3], [5, 5]]]
 
-      it "recyles existing selection instances", ->
+      it "recycles existing selection instances", ->
         selection = editor.getLastSelection()
         editor.setSelectedBufferRanges([[[2, 2], [3, 3]], [[4, 4], [5, 5]]])
 
@@ -1503,23 +1872,23 @@ describe "TextEditor", ->
 
       describe "when the 'preserveFolds' option is false (the default)", ->
         it "removes folds that contain the selections", ->
-          editor.setSelectedBufferRange([[0,0], [0,0]])
-          editor.createFold(1, 4)
-          editor.createFold(2, 3)
-          editor.createFold(6, 8)
-          editor.createFold(10, 11)
+          editor.setSelectedBufferRange([[0, 0], [0, 0]])
+          editor.foldBufferRowRange(1, 4)
+          editor.foldBufferRowRange(2, 3)
+          editor.foldBufferRowRange(6, 8)
+          editor.foldBufferRowRange(10, 11)
 
           editor.setSelectedBufferRanges([[[2, 2], [3, 3]], [[6, 6], [7, 7]]])
-          expect(editor.tokenizedLineForScreenRow(1).fold).toBeUndefined()
-          expect(editor.tokenizedLineForScreenRow(2).fold).toBeUndefined()
-          expect(editor.tokenizedLineForScreenRow(6).fold).toBeUndefined()
-          expect(editor.tokenizedLineForScreenRow(10).fold).toBeDefined()
+          expect(editor.isFoldedAtScreenRow(1)).toBeFalsy()
+          expect(editor.isFoldedAtScreenRow(2)).toBeFalsy()
+          expect(editor.isFoldedAtScreenRow(6)).toBeFalsy()
+          expect(editor.isFoldedAtScreenRow(10)).toBeTruthy()
 
       describe "when the 'preserveFolds' option is true", ->
         it "does not remove folds that contain the selections", ->
-          editor.setSelectedBufferRange([[0,0], [0,0]])
-          editor.createFold(1, 4)
-          editor.createFold(6, 8)
+          editor.setSelectedBufferRange([[0, 0], [0, 0]])
+          editor.foldBufferRowRange(1, 4)
+          editor.foldBufferRowRange(6, 8)
           editor.setSelectedBufferRanges([[[2, 2], [3, 3]], [[6, 0], [6, 1]]], preserveFolds: true)
           expect(editor.isFoldedAtBufferRow(1)).toBeTruthy()
           expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
@@ -1542,37 +1911,13 @@ describe "TextEditor", ->
         editor.setSelectedBufferRanges([[[2, 2], [3, 3]], [[3, 0], [5, 5]]])
         expect(editor.getSelectedBufferRanges()).toEqual [[[2, 2], [5, 5]]]
 
-      it "recyles existing selection instances", ->
+      it "recycles existing selection instances", ->
         selection = editor.getLastSelection()
         editor.setSelectedScreenRanges([[[2, 2], [3, 4]], [[4, 4], [5, 5]]])
 
         [selection1, selection2] = editor.getSelections()
         expect(selection1).toBe selection
         expect(selection1.getScreenRange()).toEqual [[2, 2], [3, 4]]
-
-    describe ".setSelectedBufferRange(range)", ->
-      it "autoscrolls the selection if it is last unless the 'autoscroll' option is false", ->
-        editor.setVerticalScrollMargin(2)
-        editor.setHorizontalScrollMargin(2)
-        editor.setLineHeightInPixels(10)
-        editor.setDefaultCharWidth(10)
-        editor.setHeight(70)
-        editor.setWidth(100)
-        editor.setHorizontalScrollbarHeight(0)
-
-        expect(editor.getScrollTop()).toBe 0
-
-        editor.setSelectedBufferRange([[5, 6], [6, 8]])
-        expect(editor.getScrollBottom()).toBe (7 + editor.getVerticalScrollMargin()) * 10
-        expect(editor.getScrollRight()).toBe (8 + editor.getHorizontalScrollMargin()) * 10
-
-        editor.setSelectedBufferRange([[0, 0], [0, 0]])
-        expect(editor.getScrollTop()).toBe 0
-        expect(editor.getScrollLeft()).toBe 0
-
-        editor.setSelectedBufferRange([[6, 6], [6, 8]])
-        expect(editor.getScrollBottom()).toBe (7 + editor.getVerticalScrollMargin()) * 10
-        expect(editor.getScrollRight()).toBe (8 + editor.getHorizontalScrollMargin()) * 10
 
     describe ".selectMarker(marker)", ->
       describe "if the marker is valid", ->
@@ -1593,17 +1938,6 @@ describe "TextEditor", ->
         editor.addSelectionForBufferRange([[3, 4], [5, 6]])
         expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [0, 0]], [[3, 4], [5, 6]]]
 
-      it "autoscrolls to the added selection if needed", ->
-        editor.setVerticalScrollMargin(2)
-        editor.setHorizontalScrollMargin(2)
-        editor.setLineHeightInPixels(10)
-        editor.setDefaultCharWidth(10)
-        editor.setHeight(80)
-        editor.setWidth(100)
-        editor.addSelectionForBufferRange([[8, 10], [8, 15]])
-        expect(editor.getScrollBottom()).toBe (9 * 10) + (2 * 10)
-        expect(editor.getScrollRight()).toBe (15 * 10) + (2 * 10)
-
     describe ".addSelectionBelow()", ->
       describe "when the selection is non-empty", ->
         it "selects the same region of the line below current selections if possible", ->
@@ -1616,8 +1950,6 @@ describe "TextEditor", ->
             [[4, 16], [4, 21]]
             [[4, 25], [4, 29]]
           ]
-          for cursor in editor.getCursors()
-            expect(cursor.isVisible()).toBeFalsy()
 
         it "skips lines that are too short to create a non-empty selection", ->
           editor.setSelectedBufferRange([[3, 31], [3, 38]])
@@ -1662,6 +1994,7 @@ describe "TextEditor", ->
         it "can add selections to soft-wrapped line segments", ->
           editor.setSoftWrapped(true)
           editor.setEditorWidthInChars(40)
+          editor.setDefaultCharWidth(1)
 
           editor.setSelectedScreenRange([[3, 10], [3, 15]])
           editor.addSelectionBelow()
@@ -1672,7 +2005,7 @@ describe "TextEditor", ->
 
         it "takes atomic tokens into account", ->
           waitsForPromise ->
-            atom.project.open('sample-with-tabs-and-leading-comment.coffee', autoIndent: false).then (o) -> editor = o
+            atom.workspace.open('sample-with-tabs-and-leading-comment.coffee', autoIndent: false).then (o) -> editor = o
 
           runs ->
             editor.setSelectedBufferRange([[2, 1], [2, 3]])
@@ -1687,6 +2020,7 @@ describe "TextEditor", ->
         describe "when lines are soft-wrapped", ->
           beforeEach ->
             editor.setSoftWrapped(true)
+            editor.setDefaultCharWidth(1)
             editor.setEditorWidthInChars(40)
 
           it "skips soft-wrap indentation tokens", ->
@@ -1747,8 +2081,6 @@ describe "TextEditor", ->
             [[2, 16], [2, 21]]
             [[2, 37], [2, 40]]
           ]
-          for cursor in editor.getCursors()
-            expect(cursor.isVisible()).toBeFalsy()
 
         it "skips lines that are too short to create a non-empty selection", ->
           editor.setSelectedBufferRange([[6, 31], [6, 38]])
@@ -1772,6 +2104,7 @@ describe "TextEditor", ->
 
         it "can add selections to soft-wrapped line segments", ->
           editor.setSoftWrapped(true)
+          editor.setDefaultCharWidth(1)
           editor.setEditorWidthInChars(40)
 
           editor.setSelectedScreenRange([[4, 10], [4, 15]])
@@ -1783,7 +2116,7 @@ describe "TextEditor", ->
 
         it "takes atomic tokens into account", ->
           waitsForPromise ->
-            atom.project.open('sample-with-tabs-and-leading-comment.coffee', autoIndent: false).then (o) -> editor = o
+            atom.workspace.open('sample-with-tabs-and-leading-comment.coffee', autoIndent: false).then (o) -> editor = o
 
           runs ->
             editor.setSelectedBufferRange([[3, 1], [3, 2]])
@@ -1798,6 +2131,7 @@ describe "TextEditor", ->
         describe "when lines are soft-wrapped", ->
           beforeEach ->
             editor.setSoftWrapped(true)
+            editor.setDefaultCharWidth(1)
             editor.setEditorWidthInChars(40)
 
           it "skips soft-wrap indentation tokens", ->
@@ -1867,19 +2201,30 @@ describe "TextEditor", ->
         editor.splitSelectionsIntoLines()
         expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [0, 3]]]
 
-    describe ".consolidateSelections()", ->
-      it "destroys all selections but the most recent, returning true if any selections were destroyed", ->
-        editor.setSelectedBufferRange([[3, 16], [3, 21]])
-        selection1 = editor.getLastSelection()
+    describe "::consolidateSelections()", ->
+      makeMultipleSelections = ->
+        selection.setBufferRange [[3, 16], [3, 21]]
         selection2 = editor.addSelectionForBufferRange([[3, 25], [3, 34]])
         selection3 = editor.addSelectionForBufferRange([[8, 4], [8, 10]])
+        selection4 = editor.addSelectionForBufferRange([[1, 6], [1, 10]])
+        expect(editor.getSelections()).toEqual [selection, selection2, selection3, selection4]
+        [selection, selection2, selection3, selection4]
 
-        expect(editor.getSelections()).toEqual [selection1, selection2, selection3]
+      it "destroys all selections but the oldest selection and autoscrolls to it, returning true if any selections were destroyed", ->
+        [selection1] = makeMultipleSelections()
+
+        autoscrollEvents = []
+        editor.onDidRequestAutoscroll (event) -> autoscrollEvents.push(event)
+
         expect(editor.consolidateSelections()).toBeTruthy()
-        expect(editor.getSelections()).toEqual [selection3]
-        expect(selection3.isEmpty()).toBeFalsy()
+        expect(editor.getSelections()).toEqual [selection1]
+        expect(selection1.isEmpty()).toBeFalsy()
         expect(editor.consolidateSelections()).toBeFalsy()
-        expect(editor.getSelections()).toEqual [selection3]
+        expect(editor.getSelections()).toEqual [selection1]
+
+        expect(autoscrollEvents).toEqual([
+          {screenRange: selection1.getScreenRange(), options: {center: true, reversed: false}}
+        ])
 
     describe "when the cursor is moved while there is a selection", ->
       makeSelection = -> selection.setBufferRange [[1, 2], [1, 5]]
@@ -1908,14 +2253,725 @@ describe "TextEditor", ->
     it "does not share selections between different edit sessions for the same buffer", ->
       editor2 = null
       waitsForPromise ->
-        atom.project.open('sample.js').then (o) -> editor2 = o
+        atom.workspace.getActivePane().splitRight()
+        atom.workspace.open(editor.getPath()).then (o) -> editor2 = o
 
       runs ->
+        expect(editor2.getText()).toBe(editor.getText())
         editor.setSelectedBufferRanges([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])
         editor2.setSelectedBufferRanges([[[8, 7], [6, 5]], [[4, 3], [2, 1]]])
         expect(editor2.getSelectedBufferRanges()).not.toEqual editor.getSelectedBufferRanges()
 
   describe "buffer manipulation", ->
+    describe ".moveLineUp", ->
+      it "moves the line under the cursor up", ->
+        editor.setCursorBufferPosition([1, 0])
+        editor.moveLineUp()
+        expect(editor.getTextInBufferRange([[0, 0], [0, 30]])).toBe "  var sort = function(items) {"
+        expect(editor.indentationForBufferRow(0)).toBe 1
+        expect(editor.indentationForBufferRow(1)).toBe 0
+
+      it "updates the line's indentation when the the autoIndent setting is true", ->
+        editor.update({autoIndent: true})
+        editor.setCursorBufferPosition([1, 0])
+        editor.moveLineUp()
+        expect(editor.indentationForBufferRow(0)).toBe 0
+        expect(editor.indentationForBufferRow(1)).toBe 0
+
+      describe "when there is a single selection", ->
+        describe "when the selection spans a single line", ->
+          describe "when there is no fold in the preceeding row", ->
+            it "moves the line to the preceding row", ->
+              expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+              editor.setSelectedBufferRange([[3, 2], [3, 9]])
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[2, 2], [2, 9]]
+              expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+
+          describe "when the cursor is at the beginning of a fold", ->
+            it "moves the line to the previous row without breaking the fold", ->
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+              editor.setSelectedBufferRange([[4, 2], [4, 9]], preserveFolds: true)
+              expect(editor.getSelectedBufferRange()).toEqual [[4, 2], [4, 9]]
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[3, 2], [3, 9]]
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.lineTextForBufferRow(7)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+
+
+          describe "when the preceding row consists of folded code", ->
+            it "moves the line above the folded row and perseveres the correct folds", ->
+              expect(editor.lineTextForBufferRow(8)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+              expect(editor.lineTextForBufferRow(9)).toBe "  };"
+
+              editor.foldBufferRowRange(4, 7)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.setSelectedBufferRange([[8, 0], [8, 4]])
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[4, 0], [4, 4]]
+              expect(editor.lineTextForBufferRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+              expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+        describe "when the selection spans multiple lines", ->
+          it "moves the lines spanned by the selection to the preceding row", ->
+            expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.setSelectedBufferRange([[3, 2], [4, 9]])
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[2, 2], [3, 9]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+            expect(editor.lineTextForBufferRow(4)).toBe "    if (items.length <= 1) return items;"
+
+          describe "when the selection's end intersects a fold", ->
+            it "moves the lines to the previous row without breaking the fold", ->
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+              editor.setSelectedBufferRange([[3, 2], [4, 9]], preserveFolds: true)
+
+              expect(editor.isFoldedAtBufferRow(3)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[2, 2], [3, 9]]
+              expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.lineTextForBufferRow(7)).toBe "    if (items.length <= 1) return items;"
+
+              expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+
+          describe "when the selection's start intersects a fold", ->
+            it "moves the lines to the previous row without breaking the fold", ->
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+              editor.setSelectedBufferRange([[4, 2], [8, 9]], preserveFolds: true)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[3, 2], [7, 9]]
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.lineTextForBufferRow(7)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+              expect(editor.lineTextForBufferRow(8)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+
+        describe "when the selection spans multiple lines, but ends at column 0", ->
+          it "does not move the last line of the selection", ->
+            expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.setSelectedBufferRange([[3, 2], [4, 0]])
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[2, 2], [3, 0]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+        describe "when the preceeding row is a folded row", ->
+          it "moves the lines spanned by the selection to the preceeding row, but preserves the folded code", ->
+            expect(editor.lineTextForBufferRow(8)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+            expect(editor.lineTextForBufferRow(9)).toBe "  };"
+
+            editor.foldBufferRowRange(4, 7)
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+            editor.setSelectedBufferRange([[8, 0], [9, 2]])
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[4, 0], [5, 2]]
+            expect(editor.lineTextForBufferRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+            expect(editor.lineTextForBufferRow(5)).toBe "  };"
+            expect(editor.lineTextForBufferRow(6)).toBe "    while(items.length > 0) {"
+            expect(editor.isFoldedAtBufferRow(5)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(10)).toBeFalsy()
+
+      describe "when there are multiple selections", ->
+        describe "when all the selections span different lines", ->
+          describe "when there is no folds", ->
+            it "moves all lines that are spanned by a selection to the preceding row", ->
+              editor.setSelectedBufferRanges([[[1, 2], [1, 9]], [[3, 2], [3, 9]], [[5, 2], [5, 9]]])
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRanges()).toEqual [[[0, 2], [0, 9]], [[2, 2], [2, 9]], [[4, 2], [4, 9]]]
+              expect(editor.lineTextForBufferRow(0)).toBe "  var sort = function(items) {"
+              expect(editor.lineTextForBufferRow(1)).toBe "var quicksort = function () {"
+              expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(4)).toBe "      current = items.shift();"
+              expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+
+          describe "when one selection intersects a fold", ->
+            it "moves the lines to the previous row without breaking the fold", ->
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+              editor.setSelectedBufferRanges([
+                [[2, 2], [2, 9]],
+                [[4, 2], [4, 9]]
+              ], preserveFolds: true)
+
+              expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(3)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRanges()).toEqual([
+                [[1, 2], [1, 9]],
+                [[3, 2], [3, 9]]
+              ])
+
+              expect(editor.lineTextForBufferRow(1)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(2)).toBe "  var sort = function(items) {"
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.lineTextForBufferRow(7)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+              expect(editor.isFoldedAtBufferRow(1)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+          describe "when there is a fold", ->
+            it "moves all lines that spanned by a selection to preceding row, preserving all folds", ->
+              editor.foldBufferRowRange(4, 7)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.setSelectedBufferRanges([[[8, 0], [8, 3]], [[11, 0], [11, 5]]])
+              editor.moveLineUp()
+
+              expect(editor.getSelectedBufferRanges()).toEqual [[[4, 0], [4, 3]], [[10, 0], [10, 5]]]
+              expect(editor.lineTextForBufferRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+              expect(editor.lineTextForBufferRow(10)).toBe "  return sort(Array.apply(this, arguments));"
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+        describe 'when there are many folds', ->
+          beforeEach ->
+            waitsForPromise ->
+              atom.workspace.open('sample-with-many-folds.js', autoIndent: false).then (o) -> editor = o
+
+          describe 'and many selections intersects folded rows', ->
+            it 'moves and preserves all the folds', ->
+              editor.foldBufferRowRange(2, 4)
+              editor.foldBufferRowRange(7, 9)
+
+              editor.setSelectedBufferRanges([
+                [[1, 0], [5, 4]],
+                [[7, 0], [7, 4]]
+              ], preserveFolds: true)
+
+              editor.moveLineUp()
+
+              expect(editor.lineTextForBufferRow(1)).toEqual "function f3() {"
+              expect(editor.lineTextForBufferRow(4)).toEqual "6;"
+              expect(editor.lineTextForBufferRow(5)).toEqual "1;"
+              expect(editor.lineTextForBufferRow(6)).toEqual "function f8() {"
+              expect(editor.lineTextForBufferRow(9)).toEqual "7;"
+
+              expect(editor.isFoldedAtBufferRow(1)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(2)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeFalsy()
+
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+        describe "when some of the selections span the same lines", ->
+          it "moves lines that contain multiple selections correctly", ->
+            editor.setSelectedBufferRanges([[[3, 2], [3, 9]], [[3, 12], [3, 13]]])
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRanges()).toEqual [[[2, 2], [2, 9]], [[2, 12], [2, 13]]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+        describe "when one of the selections spans line 0", ->
+          it "doesn't move any lines, since line 0 can't move", ->
+            editor.setSelectedBufferRanges([[[0, 2], [1, 9]], [[2, 2], [2, 9]], [[4, 2], [4, 9]]])
+
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRanges()).toEqual [[[0, 2], [1, 9]], [[2, 2], [2, 9]], [[4, 2], [4, 9]]]
+            expect(buffer.isModified()).toBe false
+
+        describe "when one of the selections spans the last line, and it is empty", ->
+          it "doesn't move any lines, since the last line can't move", ->
+            buffer.append('\n')
+            editor.setSelectedBufferRanges([[[0, 2], [1, 9]], [[2, 2], [2, 9]], [[13, 0], [13, 0]]])
+
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRanges()).toEqual [[[0, 2], [1, 9]], [[2, 2], [2, 9]], [[13, 0], [13, 0]]]
+
+    describe ".moveLineDown", ->
+      it "moves the line under the cursor down", ->
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveLineDown()
+        expect(editor.getTextInBufferRange([[1, 0], [1, 31]])).toBe "var quicksort = function () {"
+        expect(editor.indentationForBufferRow(0)).toBe 1
+        expect(editor.indentationForBufferRow(1)).toBe 0
+
+      it "updates the line's indentation when the editor.autoIndent setting is true", ->
+        editor.update({autoIndent: true})
+        editor.setCursorBufferPosition([0, 0])
+        editor.moveLineDown()
+        expect(editor.indentationForBufferRow(0)).toBe 1
+        expect(editor.indentationForBufferRow(1)).toBe 2
+
+      describe "when there is a single selection", ->
+        describe "when the selection spans a single line", ->
+          describe "when there is no fold in the following row", ->
+            it "moves the line to the following row", ->
+              expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+              editor.setSelectedBufferRange([[2, 2], [2, 9]])
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[3, 2], [3, 9]]
+              expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+
+          describe "when the cursor is at the beginning of a fold", ->
+            it "moves the line to the following row without breaking the fold", ->
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+              editor.setSelectedBufferRange([[4, 2], [4, 9]], preserveFolds: true)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[5, 2], [5, 9]]
+              expect(editor.lineTextForBufferRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+              expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+          describe "when the following row is a folded row", ->
+            it "moves the line below the folded row and preserves the fold", ->
+              expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+              editor.foldBufferRowRange(4, 7)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.setSelectedBufferRange([[3, 0], [3, 4]])
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRange()).toEqual [[7, 0], [7, 4]]
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+
+
+              expect(editor.lineTextForBufferRow(7)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+        describe "when the selection spans multiple lines", ->
+          it "moves the lines spanned by the selection to the following row", ->
+            expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.setSelectedBufferRange([[2, 2], [3, 9]])
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[3, 2], [4, 9]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    while(items.length > 0) {"
+            expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(4)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+        describe "when the selection spans multiple lines, but ends at column 0", ->
+          it "does not move the last line of the selection", ->
+            expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.setSelectedBufferRange([[2, 2], [3, 0]])
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[3, 2], [4, 0]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+        describe "when the selection's end intersects a fold", ->
+          it "moves the lines to the following row without breaking the fold", ->
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.foldBufferRowRange(4, 7)
+            editor.setSelectedBufferRange([[3, 2], [4, 9]], preserveFolds: true)
+
+            expect(editor.isFoldedAtBufferRow(3)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[4, 2], [5, 9]]
+            expect(editor.lineTextForBufferRow(3)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+            expect(editor.lineTextForBufferRow(4)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+
+            expect(editor.isFoldedAtBufferRow(4)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+        describe "when the selection's start intersects a fold", ->
+          it "moves the lines to the following row without breaking the fold", ->
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.foldBufferRowRange(4, 7)
+            editor.setSelectedBufferRange([[4, 2], [8, 9]], preserveFolds: true)
+
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[5, 2], [9, 9]]
+            expect(editor.lineTextForBufferRow(4)).toBe "  };"
+            expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+            expect(editor.lineTextForBufferRow(9)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+
+            expect(editor.isFoldedAtBufferRow(4)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(10)).toBeFalsy()
+
+        describe "when the following row is a folded row", ->
+          it "moves the lines spanned by the selection to the following row, but preserves the folded code", ->
+            expect(editor.lineTextForBufferRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+            editor.foldBufferRowRange(4, 7)
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+            editor.setSelectedBufferRange([[2, 0], [3, 2]])
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[6, 0], [7, 2]]
+            expect(editor.lineTextForBufferRow(2)).toBe "    while(items.length > 0) {"
+            expect(editor.isFoldedAtBufferRow(1)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(2)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeFalsy()
+            expect(editor.lineTextForBufferRow(6)).toBe "    if (items.length <= 1) return items;"
+
+        describe "when the last line of selection does not end with a valid line ending", ->
+          it "appends line ending to last line and moves the lines spanned by the selection to the preceeding row", ->
+            expect(editor.lineTextForBufferRow(9)).toBe "  };"
+            expect(editor.lineTextForBufferRow(10)).toBe ""
+            expect(editor.lineTextForBufferRow(11)).toBe "  return sort(Array.apply(this, arguments));"
+            expect(editor.lineTextForBufferRow(12)).toBe "};"
+
+            editor.setSelectedBufferRange([[10, 0], [12, 2]])
+            editor.moveLineUp()
+
+            expect(editor.getSelectedBufferRange()).toEqual [[9, 0], [11, 2]]
+            expect(editor.lineTextForBufferRow(9)).toBe ""
+            expect(editor.lineTextForBufferRow(10)).toBe "  return sort(Array.apply(this, arguments));"
+            expect(editor.lineTextForBufferRow(11)).toBe "};"
+            expect(editor.lineTextForBufferRow(12)).toBe "  };"
+
+      describe "when there are multiple selections", ->
+        describe "when all the selections span different lines", ->
+          describe "when there is no folds", ->
+            it "moves all lines that are spanned by a selection to the following row", ->
+              editor.setSelectedBufferRanges([[[1, 2], [1, 9]], [[3, 2], [3, 9]], [[5, 2], [5, 9]]])
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRanges()).toEqual [[[6, 2], [6, 9]], [[4, 2], [4, 9]], [[2, 2], [2, 9]]]
+              expect(editor.lineTextForBufferRow(1)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(2)).toBe "  var sort = function(items) {"
+              expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+              expect(editor.lineTextForBufferRow(4)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(5)).toBe "      current < pivot ? left.push(current) : right.push(current);"
+              expect(editor.lineTextForBufferRow(6)).toBe "      current = items.shift();"
+
+          describe 'when there are many folds', ->
+            beforeEach ->
+              waitsForPromise ->
+                atom.workspace.open('sample-with-many-folds.js', autoIndent: false).then (o) -> editor = o
+
+            describe 'and many selections intersects folded rows', ->
+              it 'moves and preserves all the folds', ->
+                editor.foldBufferRowRange(2, 4)
+                editor.foldBufferRowRange(7, 9)
+
+                editor.setSelectedBufferRanges([
+                  [[2, 0], [2, 4]],
+                  [[6, 0], [10, 4]]
+                ], preserveFolds: true)
+
+                editor.moveLineDown()
+
+                expect(editor.lineTextForBufferRow(2)).toEqual "6;"
+                expect(editor.lineTextForBufferRow(3)).toEqual "function f3() {"
+                expect(editor.lineTextForBufferRow(6)).toEqual "12;"
+                expect(editor.lineTextForBufferRow(7)).toEqual "7;"
+                expect(editor.lineTextForBufferRow(8)).toEqual "function f8() {"
+                expect(editor.lineTextForBufferRow(11)).toEqual "11;"
+
+                expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+                expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(6)).toBeFalsy()
+                expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+                expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(9)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(10)).toBeTruthy()
+                expect(editor.isFoldedAtBufferRow(11)).toBeFalsy()
+
+          describe "when there is a fold below one of the selected row", ->
+            it "moves all lines spanned by a selection to the following row, preserving the fold", ->
+              editor.foldBufferRowRange(4, 7)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.setSelectedBufferRanges([[[1, 2], [1, 6]], [[3, 0], [3, 4]], [[8, 0], [8, 3]]])
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRanges()).toEqual [[[9, 0], [9, 3]], [[7, 0], [7, 4]], [[2, 2], [2, 6]]]
+              expect(editor.lineTextForBufferRow(2)).toBe "  var sort = function(items) {"
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeFalsy()
+              expect(editor.lineTextForBufferRow(7)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+              expect(editor.lineTextForBufferRow(9)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+
+          describe "when there is a fold below a group of multiple selections without any lines with no selection in-between", ->
+            it "moves all the lines below the fold, preserving the fold", ->
+              editor.foldBufferRowRange(4, 7)
+
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+
+              editor.setSelectedBufferRanges([[[2, 2], [2, 6]], [[3, 0], [3, 4]]])
+              editor.moveLineDown()
+
+              expect(editor.getSelectedBufferRanges()).toEqual [[[7, 0], [7, 4]], [[6, 2], [6, 6]]]
+              expect(editor.lineTextForBufferRow(2)).toBe "    while(items.length > 0) {"
+              expect(editor.isFoldedAtBufferRow(2)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(3)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+              expect(editor.isFoldedAtBufferRow(6)).toBeFalsy()
+              expect(editor.lineTextForBufferRow(6)).toBe "    if (items.length <= 1) return items;"
+              expect(editor.lineTextForBufferRow(7)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+
+        describe "when one selection intersects a fold", ->
+          it "moves the lines to the previous row without breaking the fold", ->
+            expect(editor.lineTextForBufferRow(4)).toBe "    while(items.length > 0) {"
+
+            editor.foldBufferRowRange(4, 7)
+            editor.setSelectedBufferRanges([
+              [[2, 2], [2, 9]],
+              [[4, 2], [4, 9]]
+            ], preserveFolds: true)
+
+            expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(3)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(4)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRanges()).toEqual([
+              [[5, 2], [5, 9]]
+              [[3, 2], [3, 9]],
+            ])
+
+            expect(editor.lineTextForBufferRow(2)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.lineTextForBufferRow(3)).toBe "    if (items.length <= 1) return items;"
+            expect(editor.lineTextForBufferRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+
+            expect(editor.lineTextForBufferRow(5)).toBe "    while(items.length > 0) {"
+            expect(editor.lineTextForBufferRow(9)).toBe "  };"
+
+            expect(editor.isFoldedAtBufferRow(2)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(3)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(4)).toBeFalsy()
+            expect(editor.isFoldedAtBufferRow(5)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(6)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(7)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(8)).toBeTruthy()
+            expect(editor.isFoldedAtBufferRow(9)).toBeFalsy()
+
+        describe "when some of the selections span the same lines", ->
+          it "moves lines that contain multiple selections correctly", ->
+            editor.setSelectedBufferRanges([[[3, 2], [3, 9]], [[3, 12], [3, 13]]])
+            editor.moveLineDown()
+
+            expect(editor.getSelectedBufferRanges()).toEqual [[[4, 12], [4, 13]], [[4, 2], [4, 9]]]
+            expect(editor.lineTextForBufferRow(3)).toBe "    while(items.length > 0) {"
+
+        describe "when the selections are above a wrapped line", ->
+          beforeEach ->
+            editor.setSoftWrapped(true)
+            editor.setEditorWidthInChars(80)
+            editor.setText("""
+            1
+            2
+            Lorem ipsum dolor sit amet, consectetuer adipiscing elit, sed diam nonummy nibh euismod tincidunt ut laoreet dolore magna aliquam erat volutpat. Ut wisi enim ad minim veniam, quis nostrud exerci tation ullamcorper suscipit lobortis nisl ut aliquip ex ea commodo consequat.
+            3
+            4
+            """)
+
+          it 'moves the lines past the soft wrapped line', ->
+            editor.setSelectedBufferRanges([[[0, 0], [0, 0]], [[1, 0], [1, 0]]])
+
+            editor.moveLineDown()
+
+            expect(editor.lineTextForBufferRow(0)).not.toBe "2"
+            expect(editor.lineTextForBufferRow(1)).toBe "1"
+            expect(editor.lineTextForBufferRow(2)).toBe "2"
+
+      describe "when the line is the last buffer row", ->
+        it "doesn't move it", ->
+          editor.setText("abc\ndef")
+          editor.setCursorBufferPosition([1, 0])
+          editor.moveLineDown()
+          expect(editor.getText()).toBe("abc\ndef")
+
     describe ".insertText(text)", ->
       describe "when there is a single selection", ->
         beforeEach ->
@@ -1954,20 +3010,10 @@ describe "TextEditor", ->
             expect(cursor1.getBufferPosition()).toEqual [1, 5]
             expect(cursor2.getBufferPosition()).toEqual [2, 7]
 
-          it "autoscrolls to the last cursor", ->
-            editor.setCursorScreenPosition([1, 2])
-            editor.addCursorAtScreenPosition([10, 4])
-            editor.setLineHeightInPixels(10)
-            editor.setHeight(50)
-
-            expect(editor.getScrollTop()).toBe 0
-            editor.insertText('a')
-            expect(editor.getScrollTop()).toBe 80
-
       describe "when there are multiple non-empty selections", ->
         describe "when the selections are on the same line", ->
           it "replaces each selection range with the inserted characters", ->
-            editor.setSelectedBufferRanges([[[0,4], [0,13]], [[0,22], [0,24]]])
+            editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[0, 22], [0, 24]]])
             editor.insertText("x")
 
             [cursor1, cursor2] = editor.getCursors()
@@ -1997,10 +3043,10 @@ describe "TextEditor", ->
 
       describe "when there is a selection that ends on a folded line", ->
         it "destroys the selection", ->
-          editor.createFold(2,4)
-          editor.setSelectedBufferRange([[1,0], [2,0]])
+          editor.foldBufferRowRange(2, 4)
+          editor.setSelectedBufferRange([[1, 0], [2, 0]])
           editor.insertText('holy cow')
-          expect(editor.tokenizedLineForScreenRow(2).fold).toBeUndefined()
+          expect(editor.isFoldedAtScreenRow(2)).toBeFalsy()
 
       describe "when there are ::onWillInsertText and ::onDidInsertText observers", ->
         beforeEach ->
@@ -2119,20 +3165,20 @@ describe "TextEditor", ->
             expect(editor.lineTextForBufferRow(9)).toBe "    }"
 
             [cursor1, cursor2] = editor.getCursors()
-            expect(cursor1.getBufferPosition()).toEqual [4,0]
-            expect(cursor2.getBufferPosition()).toEqual [8,0]
+            expect(cursor1.getBufferPosition()).toEqual [4, 0]
+            expect(cursor2.getBufferPosition()).toEqual [8, 0]
 
     describe ".insertNewlineBelow()", ->
       describe "when the operation is undone", ->
         it "places the cursor back at the previous location", ->
-          editor.setCursorBufferPosition([0,2])
+          editor.setCursorBufferPosition([0, 2])
           editor.insertNewlineBelow()
-          expect(editor.getCursorBufferPosition()).toEqual [1,0]
+          expect(editor.getCursorBufferPosition()).toEqual [1, 0]
           editor.undo()
-          expect(editor.getCursorBufferPosition()).toEqual [0,2]
+          expect(editor.getCursorBufferPosition()).toEqual [0, 2]
 
       it "inserts a newline below the cursor's current line, autoindents it, and moves the cursor to the end of the line", ->
-        atom.config.set("editor.autoIndent", true)
+        editor.update({autoIndent: true})
         editor.insertNewlineBelow()
         expect(buffer.lineForRow(0)).toBe "var quicksort = function () {"
         expect(buffer.lineForRow(1)).toBe "  "
@@ -2143,58 +3189,112 @@ describe "TextEditor", ->
         it "inserts a newline on the first line and moves the cursor to the first line", ->
           editor.setCursorBufferPosition([0])
           editor.insertNewlineAbove()
-          expect(editor.getCursorBufferPosition()).toEqual [0,0]
+          expect(editor.getCursorBufferPosition()).toEqual [0, 0]
           expect(editor.lineTextForBufferRow(0)).toBe ''
           expect(editor.lineTextForBufferRow(1)).toBe 'var quicksort = function () {'
           expect(editor.buffer.getLineCount()).toBe 14
 
       describe "when the cursor is not on the first line", ->
         it "inserts a newline above the current line and moves the cursor to the inserted line", ->
-          editor.setCursorBufferPosition([3,4])
+          editor.setCursorBufferPosition([3, 4])
           editor.insertNewlineAbove()
-          expect(editor.getCursorBufferPosition()).toEqual [3,0]
+          expect(editor.getCursorBufferPosition()).toEqual [3, 0]
           expect(editor.lineTextForBufferRow(3)).toBe ''
           expect(editor.lineTextForBufferRow(4)).toBe '    var pivot = items.shift(), current, left = [], right = [];'
           expect(editor.buffer.getLineCount()).toBe 14
 
           editor.undo()
-          expect(editor.getCursorBufferPosition()).toEqual [3,4]
+          expect(editor.getCursorBufferPosition()).toEqual [3, 4]
 
       it "indents the new line to the correct level when editor.autoIndent is true", ->
-        atom.config.set('editor.autoIndent', true)
+        editor.update({autoIndent: true})
 
         editor.setText('  var test')
-        editor.setCursorBufferPosition([0,2])
+        editor.setCursorBufferPosition([0, 2])
         editor.insertNewlineAbove()
 
-        expect(editor.getCursorBufferPosition()).toEqual [0,2]
+        expect(editor.getCursorBufferPosition()).toEqual [0, 2]
         expect(editor.lineTextForBufferRow(0)).toBe '  '
         expect(editor.lineTextForBufferRow(1)).toBe '  var test'
 
         editor.setText('\n  var test')
-        editor.setCursorBufferPosition([1,2])
+        editor.setCursorBufferPosition([1, 2])
         editor.insertNewlineAbove()
 
-        expect(editor.getCursorBufferPosition()).toEqual [1,2]
+        expect(editor.getCursorBufferPosition()).toEqual [1, 2]
         expect(editor.lineTextForBufferRow(0)).toBe ''
         expect(editor.lineTextForBufferRow(1)).toBe '  '
         expect(editor.lineTextForBufferRow(2)).toBe '  var test'
 
         editor.setText('function() {\n}')
-        editor.setCursorBufferPosition([1,1])
+        editor.setCursorBufferPosition([1, 1])
         editor.insertNewlineAbove()
 
-        expect(editor.getCursorBufferPosition()).toEqual [1,2]
+        expect(editor.getCursorBufferPosition()).toEqual [1, 2]
         expect(editor.lineTextForBufferRow(0)).toBe 'function() {'
         expect(editor.lineTextForBufferRow(1)).toBe '  '
         expect(editor.lineTextForBufferRow(2)).toBe '}'
 
-    describe "when a new line is appended before a closing tag (e.g. by pressing enter before a selection)", ->
-      it "moves the line down and keeps the indentation level the same when editor.autoIndent is true", ->
-        atom.config.set('editor.autoIndent', true)
-        editor.setCursorBufferPosition([9,2])
-        editor.insertNewline()
-        expect(editor.lineTextForBufferRow(10)).toBe '  };'
+    describe ".insertNewLine()", ->
+      describe "when a new line is appended before a closing tag (e.g. by pressing enter before a selection)", ->
+        it "moves the line down and keeps the indentation level the same when editor.autoIndent is true", ->
+          editor.update({autoIndent: true})
+          editor.setCursorBufferPosition([9, 2])
+          editor.insertNewline()
+          expect(editor.lineTextForBufferRow(10)).toBe '  };'
+
+      describe "when a newline is appended with a trailing closing tag behind the cursor (e.g. by pressing enter in the middel of a line)", ->
+        it "indents the new line to the correct level when editor.autoIndent is true and using a curly-bracket language", ->
+          waitsForPromise ->
+            atom.packages.activatePackage('language-javascript')
+
+          runs ->
+            editor.update({autoIndent: true})
+            editor.setGrammar(atom.grammars.selectGrammar("file.js"))
+            editor.setText('var test = function () {\n  return true;};')
+            editor.setCursorBufferPosition([1, 14])
+            editor.insertNewline()
+            expect(editor.indentationForBufferRow(1)).toBe 1
+            expect(editor.indentationForBufferRow(2)).toBe 0
+
+        it "indents the new line to the current level when editor.autoIndent is true and no increaseIndentPattern is specified", ->
+          runs ->
+            editor.setGrammar(atom.grammars.selectGrammar("file"))
+            editor.update({autoIndent: true})
+            editor.setText('  if true')
+            editor.setCursorBufferPosition([0, 8])
+            editor.insertNewline()
+            expect(editor.getGrammar()).toBe atom.grammars.nullGrammar
+            expect(editor.indentationForBufferRow(0)).toBe 1
+            expect(editor.indentationForBufferRow(1)).toBe 1
+
+        it "indents the new line to the correct level when editor.autoIndent is true and using an off-side rule language", ->
+          waitsForPromise ->
+            atom.packages.activatePackage('language-coffee-script')
+
+          runs ->
+            editor.update({autoIndent: true})
+            editor.setGrammar(atom.grammars.selectGrammar("file.coffee"))
+            editor.setText('if true\n  return trueelse\n  return false')
+            editor.setCursorBufferPosition([1, 13])
+            editor.insertNewline()
+            expect(editor.indentationForBufferRow(1)).toBe 1
+            expect(editor.indentationForBufferRow(2)).toBe 0
+            expect(editor.indentationForBufferRow(3)).toBe 1
+
+      describe "when a newline is appended on a line that matches the decreaseNextIndentPattern", ->
+        it "indents the new line to the correct level when editor.autoIndent is true", ->
+          waitsForPromise ->
+            atom.packages.activatePackage('language-go')
+
+          runs ->
+            editor.update({autoIndent: true})
+            editor.setGrammar(atom.grammars.selectGrammar("file.go"))
+            editor.setText('fmt.Printf("some%s",\n	"thing")')
+            editor.setCursorBufferPosition([1, 10])
+            editor.insertNewline()
+            expect(editor.indentationForBufferRow(1)).toBe 1
+            expect(editor.indentationForBufferRow(2)).toBe 0
 
     describe ".backspace()", ->
       describe "when there is a single cursor", ->
@@ -2216,7 +3316,6 @@ describe "TextEditor", ->
             expect(line).toBe "  var ort = function(items) {"
             expect(editor.getCursorScreenPosition()).toEqual {row: 1, column: 6}
             expect(changeScreenRangeHandler).toHaveBeenCalled()
-            expect(editor.getLastCursor().isVisible()).toBeTruthy()
 
         describe "when the cursor is at the beginning of a line", ->
           it "joins it with the line above", ->
@@ -2240,35 +3339,33 @@ describe "TextEditor", ->
             editor.setCursorScreenPosition(row: 0, column: 0)
             editor.backspace()
 
-        describe "when the cursor is on the first column of a line below a fold", ->
-          it "deletes the folded lines", ->
-            editor.setCursorScreenPosition([4,0])
-            editor.foldCurrentRow()
-            editor.setCursorScreenPosition([5,0])
+        describe "when the cursor is after a fold", ->
+          it "deletes the folded range", ->
+            editor.foldBufferRange([[4, 7], [5, 8]])
+            editor.setCursorBufferPosition([5, 8])
             editor.backspace()
 
-            expect(buffer.lineForRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
-            expect(buffer.lineForRow(4).fold).toBeUndefined()
+            expect(buffer.lineForRow(4)).toBe "    whirrent = items.shift();"
+            expect(editor.isFoldedAtBufferRow(4)).toBe(false)
 
         describe "when the cursor is in the middle of a line below a fold", ->
           it "backspaces as normal", ->
-            editor.setCursorScreenPosition([4,0])
+            editor.setCursorScreenPosition([4, 0])
             editor.foldCurrentRow()
-            editor.setCursorScreenPosition([5,5])
+            editor.setCursorScreenPosition([5, 5])
             editor.backspace()
 
             expect(buffer.lineForRow(7)).toBe "    }"
             expect(buffer.lineForRow(8)).toBe "    eturn sort(left).concat(pivot).concat(sort(right));"
 
         describe "when the cursor is on a folded screen line", ->
-          it "deletes all of the folded lines along with the fold", ->
+          it "deletes the contents of the fold before the cursor", ->
             editor.setCursorBufferPosition([3, 0])
             editor.foldCurrentRow()
             editor.backspace()
 
-            expect(buffer.lineForRow(1)).toBe ""
-            expect(buffer.lineForRow(2)).toBe "  return sort(Array.apply(this, arguments));"
-            expect(editor.getCursorScreenPosition()).toEqual [1, 0]
+            expect(buffer.lineForRow(1)).toBe "  var sort = function(items)     var pivot = items.shift(), current, left = [], right = [];"
+            expect(editor.getCursorScreenPosition()).toEqual [1, 29]
 
       describe "when there are multiple cursors", ->
         describe "when cursors are on the same line", ->
@@ -2319,29 +3416,85 @@ describe "TextEditor", ->
               expect(editor.lineTextForBufferRow(5)).toBe "    }"
 
               [cursor1, cursor2] = editor.getCursors()
-              expect(cursor1.getBufferPosition()).toEqual [2,40]
-              expect(cursor2.getBufferPosition()).toEqual [4,30]
+              expect(cursor1.getBufferPosition()).toEqual [2, 40]
+              expect(cursor2.getBufferPosition()).toEqual [4, 30]
 
       describe "when there is a single selection", ->
         it "deletes the selection, but not the character before it", ->
-          editor.setSelectedBufferRange([[0,5], [0,9]])
+          editor.setSelectedBufferRange([[0, 5], [0, 9]])
           editor.backspace()
           expect(editor.buffer.lineForRow(0)).toBe 'var qsort = function () {'
 
         describe "when the selection ends on a folded line", ->
           it "preserves the fold", ->
-            editor.setSelectedBufferRange([[3,0], [4,0]])
+            editor.setSelectedBufferRange([[3, 0], [4, 0]])
             editor.foldBufferRow(4)
             editor.backspace()
 
             expect(buffer.lineForRow(3)).toBe "    while(items.length > 0) {"
-            expect(editor.tokenizedLineForScreenRow(3).fold).toBeDefined()
+            expect(editor.isFoldedAtScreenRow(3)).toBe(true)
 
       describe "when there are multiple selections", ->
         it "removes all selected text", ->
-          editor.setSelectedBufferRanges([[[0,4], [0,13]], [[0,16], [0,24]]])
+          editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[0, 16], [0, 24]]])
           editor.backspace()
           expect(editor.lineTextForBufferRow(0)).toBe 'var  =  () {'
+
+    describe ".deleteToPreviousWordBoundary()", ->
+      describe "when no text is selected", ->
+        it "deletes to the previous word boundary", ->
+          editor.setCursorBufferPosition([0, 16])
+          editor.addCursorAtBufferPosition([1, 21])
+          [cursor1, cursor2] = editor.getCursors()
+
+          editor.deleteToPreviousWordBoundary()
+          expect(buffer.lineForRow(0)).toBe 'var quicksort =function () {'
+          expect(buffer.lineForRow(1)).toBe '  var sort = (items) {'
+          expect(cursor1.getBufferPosition()).toEqual [0, 15]
+          expect(cursor2.getBufferPosition()).toEqual [1, 13]
+
+          editor.deleteToPreviousWordBoundary()
+          expect(buffer.lineForRow(0)).toBe 'var quicksort function () {'
+          expect(buffer.lineForRow(1)).toBe '  var sort =(items) {'
+          expect(cursor1.getBufferPosition()).toEqual [0, 14]
+          expect(cursor2.getBufferPosition()).toEqual [1, 12]
+
+      describe "when text is selected", ->
+        it "deletes only selected text", ->
+          editor.setSelectedBufferRange([[1, 24], [1, 27]])
+          editor.deleteToPreviousWordBoundary()
+          expect(buffer.lineForRow(1)).toBe '  var sort = function(it) {'
+
+    describe ".deleteToNextWordBoundary()", ->
+      describe "when no text is selected", ->
+        it "deletes to the next word boundary", ->
+          editor.setCursorBufferPosition([0, 15])
+          editor.addCursorAtBufferPosition([1, 24])
+          [cursor1, cursor2] = editor.getCursors()
+
+          editor.deleteToNextWordBoundary()
+          expect(buffer.lineForRow(0)).toBe 'var quicksort =function () {'
+          expect(buffer.lineForRow(1)).toBe '  var sort = function(it) {'
+          expect(cursor1.getBufferPosition()).toEqual [0, 15]
+          expect(cursor2.getBufferPosition()).toEqual [1, 24]
+
+          editor.deleteToNextWordBoundary()
+          expect(buffer.lineForRow(0)).toBe 'var quicksort = () {'
+          expect(buffer.lineForRow(1)).toBe '  var sort = function(it {'
+          expect(cursor1.getBufferPosition()).toEqual [0, 15]
+          expect(cursor2.getBufferPosition()).toEqual [1, 24]
+
+          editor.deleteToNextWordBoundary()
+          expect(buffer.lineForRow(0)).toBe 'var quicksort =() {'
+          expect(buffer.lineForRow(1)).toBe '  var sort = function(it{'
+          expect(cursor1.getBufferPosition()).toEqual [0, 15]
+          expect(cursor2.getBufferPosition()).toEqual [1, 24]
+
+      describe "when text is selected", ->
+        it "deletes only selected text", ->
+          editor.setSelectedBufferRange([[1, 24], [1, 27]])
+          editor.deleteToNextWordBoundary()
+          expect(buffer.lineForRow(1)).toBe '  var sort = function(it) {'
 
     describe ".deleteToBeginningOfWord()", ->
       describe "when no text is selected", ->
@@ -2426,7 +3579,7 @@ describe "TextEditor", ->
             expect(buffer.lineForRow(1)).toBe '  var sort = function(items) {    if (items.length <= 1) return items;'
 
       describe "when text is selected", ->
-        it "still deletes all text to begginning of the line", ->
+        it "still deletes all text to beginning of the line", ->
           editor.setSelectedBufferRanges([[[1, 24], [1, 27]], [[2, 0], [2, 4]]])
           editor.deleteToBeginningOfLine()
           expect(buffer.lineForRow(1)).toBe 'ems) {'
@@ -2452,16 +3605,16 @@ describe "TextEditor", ->
             editor.delete()
             expect(buffer.lineForRow(12)).toBe '};'
 
-        describe "when the cursor is on the end of a line above a fold", ->
+        describe "when the cursor is before a fold", ->
           it "only deletes the lines inside the fold", ->
-            editor.foldBufferRow(4)
-            editor.setCursorScreenPosition([3, Infinity])
+            editor.foldBufferRange([[3, 6], [4, 8]])
+            editor.setCursorScreenPosition([3, 6])
             cursorPositionBefore = editor.getCursorScreenPosition()
 
             editor.delete()
 
-            expect(buffer.lineForRow(3)).toBe "    var pivot = items.shift(), current, left = [], right = [];"
-            expect(buffer.lineForRow(4)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+            expect(buffer.lineForRow(3)).toBe "    vae(items.length > 0) {"
+            expect(buffer.lineForRow(4)).toBe "      current = items.shift();"
             expect(editor.getCursorScreenPosition()).toEqual cursorPositionBefore
 
         describe "when the cursor is in the middle a line above a fold", ->
@@ -2473,20 +3626,21 @@ describe "TextEditor", ->
             editor.delete()
 
             expect(buffer.lineForRow(3)).toBe "    ar pivot = items.shift(), current, left = [], right = [];"
-            expect(editor.tokenizedLineForScreenRow(4).fold).toBeDefined()
+            expect(editor.isFoldedAtScreenRow(4)).toBe(true)
             expect(editor.getCursorScreenPosition()).toEqual [3, 4]
 
-        describe "when the cursor is on a folded line", ->
-          it "removes the lines contained by the fold", ->
-            editor.setSelectedBufferRange([[2, 0], [2, 0]])
-            editor.createFold(2,4)
-            editor.createFold(2,6)
-            oldLine7 = buffer.lineForRow(7)
-            oldLine8 = buffer.lineForRow(8)
+        describe "when the cursor is inside a fold", ->
+          it "removes the folded content after the cursor", ->
+            editor.foldBufferRange([[2, 6], [6, 21]])
+            editor.setCursorBufferPosition([4, 9])
 
             editor.delete()
-            expect(editor.tokenizedLineForScreenRow(2).text).toBe oldLine7
-            expect(editor.tokenizedLineForScreenRow(3).text).toBe oldLine8
+
+            expect(buffer.lineForRow(2)).toBe '    if (items.length <= 1) return items;'
+            expect(buffer.lineForRow(3)).toBe '    var pivot = items.shift(), current, left = [], right = [];'
+            expect(buffer.lineForRow(4)).toBe '    while ? left.push(current) : right.push(current);'
+            expect(buffer.lineForRow(5)).toBe '    }'
+            expect(editor.getCursorBufferPosition()).toEqual [4, 9]
 
       describe "when there are multiple cursors", ->
         describe "when cursors are on the same line", ->
@@ -2535,8 +3689,8 @@ describe "TextEditor", ->
               expect(editor.lineTextForBufferRow(0)).toBe "var quicksort = function () {  var sort = function(items) {    if (items.length <= 1) return items;"
 
               [cursor1, cursor2] = editor.getCursors()
-              expect(cursor1.getBufferPosition()).toEqual [0,29]
-              expect(cursor2.getBufferPosition()).toEqual [0,59]
+              expect(cursor1.getBufferPosition()).toEqual [0, 29]
+              expect(cursor2.getBufferPosition()).toEqual [0, 59]
 
       describe "when there is a single selection", ->
         it "deletes the selection, but not the character following it", ->
@@ -2549,7 +3703,7 @@ describe "TextEditor", ->
       describe "when there are multiple selections", ->
         describe "when selections are on the same line", ->
           it "removes all selected text", ->
-            editor.setSelectedBufferRanges([[[0,4], [0,13]], [[0,16], [0,24]]])
+            editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[0, 16], [0, 24]]])
             editor.delete()
             expect(editor.lineTextForBufferRow(0)).toBe 'var  =  () {'
 
@@ -2612,7 +3766,7 @@ describe "TextEditor", ->
         describe "when autoIndent is enabled", ->
           describe "when the cursor's column is less than the suggested level of indentation", ->
             describe "when 'softTabs' is true (the default)", ->
-              it "moves the cursor to the end of the leading whitespace and inserts enough whitespace to bring the line to the suggested level of indentaion", ->
+              it "moves the cursor to the end of the leading whitespace and inserts enough whitespace to bring the line to the suggested level of indentation", ->
                 buffer.insert([5, 0], "  \n")
                 editor.setCursorBufferPosition [5, 0]
                 editor.indent(autoIndent: true)
@@ -2635,7 +3789,7 @@ describe "TextEditor", ->
                 expect(buffer.lineForRow(13).length).toBe 8
 
             describe "when 'softTabs' is false", ->
-              it "moves the cursor to the end of the leading whitespace and inserts enough tabs to bring the line to the suggested level of indentaion", ->
+              it "moves the cursor to the end of the leading whitespace and inserts enough tabs to bring the line to the suggested level of indentation", ->
                 convertToHardTabs(buffer)
                 editor.setSoftTabs(false)
                 buffer.insert([5, 0], "\t\n")
@@ -2727,9 +3881,9 @@ describe "TextEditor", ->
         describe "when many selections get added in shuffle order", ->
           it "cuts them in order", ->
             editor.setSelectedBufferRanges([
-              [[2,8], [2, 13]]
-              [[0,4], [0,13]],
-              [[1,6], [1, 10]],
+              [[2, 8], [2, 13]]
+              [[0, 4], [0, 13]],
+              [[1, 6], [1, 10]],
             ])
             editor.cutSelectedText()
             expect(atom.clipboard.read()).toEqual """
@@ -2742,10 +3896,11 @@ describe "TextEditor", ->
         describe "when soft wrap is on", ->
           it "cuts up to the end of the line", ->
             editor.setSoftWrapped(true)
-            editor.setEditorWidthInChars(10)
-            editor.setCursorScreenPosition([2, 2])
+            editor.setDefaultCharWidth(1)
+            editor.setEditorWidthInChars(25)
+            editor.setCursorScreenPosition([2, 6])
             editor.cutToEndOfLine()
-            expect(editor.tokenizedLineForScreenRow(2).text).toBe '=  () {'
+            expect(editor.lineTextForScreenRow(2)).toBe '  var  function(items) {'
 
         describe "when soft wrap is off", ->
           describe "when nothing is selected", ->
@@ -2759,7 +3914,7 @@ describe "TextEditor", ->
 
           describe "when text is selected", ->
             it "only cuts the selected text, not to the end of the line", ->
-              editor.setSelectedBufferRanges([[[2,20], [2, 30]], [[3, 20], [3, 20]]])
+              editor.setSelectedBufferRanges([[[2, 20], [2, 30]], [[3, 20], [3, 20]]])
 
               editor.cutToEndOfLine()
 
@@ -2767,9 +3922,35 @@ describe "TextEditor", ->
               expect(buffer.lineForRow(3)).toBe '    var pivot = item'
               expect(atom.clipboard.read()).toBe ' <= 1) ret\ns.shift(), current, left = [], right = [];'
 
+      describe ".cutToEndOfBufferLine()", ->
+        beforeEach ->
+          editor.setSoftWrapped(true)
+          editor.setEditorWidthInChars(10)
+
+        describe "when nothing is selected", ->
+          it "cuts up to the end of the buffer line", ->
+            editor.setCursorBufferPosition([2, 20])
+            editor.addCursorAtBufferPosition([3, 20])
+
+            editor.cutToEndOfBufferLine()
+
+            expect(buffer.lineForRow(2)).toBe '    if (items.length'
+            expect(buffer.lineForRow(3)).toBe '    var pivot = item'
+            expect(atom.clipboard.read()).toBe ' <= 1) return items;\ns.shift(), current, left = [], right = [];'
+
+        describe "when text is selected", ->
+          it "only cuts the selected text, not to the end of the buffer line", ->
+            editor.setSelectedBufferRanges([[[2, 20], [2, 30]], [[3, 20], [3, 20]]])
+
+            editor.cutToEndOfBufferLine()
+
+            expect(buffer.lineForRow(2)).toBe '    if (items.lengthurn items;'
+            expect(buffer.lineForRow(3)).toBe '    var pivot = item'
+            expect(atom.clipboard.read()).toBe ' <= 1) ret\ns.shift(), current, left = [], right = [];'
+
       describe ".copySelectedText()", ->
         it "copies selected text onto the clipboard", ->
-          editor.setSelectedBufferRanges([[[0,4], [0,13]], [[1,6], [1, 10]], [[2,8], [2, 13]]])
+          editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[1, 6], [1, 10]], [[2, 8], [2, 13]]])
 
           editor.copySelectedText()
           expect(buffer.lineForRow(0)).toBe "var quicksort = function () {"
@@ -2803,9 +3984,9 @@ describe "TextEditor", ->
         describe "when many selections get added in shuffle order", ->
           it "copies them in order", ->
             editor.setSelectedBufferRanges([
-              [[2,8], [2, 13]]
-              [[0,4], [0,13]],
-              [[1,6], [1, 10]],
+              [[2, 8], [2, 13]]
+              [[0, 4], [0, 13]],
+              [[1, 6], [1, 10]],
             ])
             editor.copySelectedText()
             expect(atom.clipboard.read()).toEqual """
@@ -2813,6 +3994,28 @@ describe "TextEditor", ->
               sort
               items
             """
+
+      describe ".copyOnlySelectedText()", ->
+        describe "when thee are multiple selections", ->
+          it "copies selected text onto the clipboard", ->
+            editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[1, 6], [1, 10]], [[2, 8], [2, 13]]])
+
+            editor.copyOnlySelectedText()
+            expect(buffer.lineForRow(0)).toBe "var quicksort = function () {"
+            expect(buffer.lineForRow(1)).toBe "  var sort = function(items) {"
+            expect(buffer.lineForRow(2)).toBe "    if (items.length <= 1) return items;"
+            expect(clipboard.readText()).toBe 'quicksort\nsort\nitems'
+            expect(atom.clipboard.read()).toEqual """
+              quicksort
+              sort
+              items
+            """
+
+        describe "when no text is selected", ->
+          it "does not copy anything", ->
+            editor.setCursorBufferPosition([1, 5])
+            editor.copyOnlySelectedText()
+            expect(atom.clipboard.read()).toEqual "initial clipboard content"
 
       describe ".pasteText()", ->
         copyText = (text, {startColumn, textEditor}={}) ->
@@ -2822,7 +4025,7 @@ describe "TextEditor", ->
           textEditor.insertText(text)
           numberOfNewlines = text.match(/\n/g)?.length
           endColumn = text.match(/[^\n]*$/)[0]?.length
-          textEditor.getLastSelection().setBufferRange([[0,startColumn], [numberOfNewlines,endColumn]])
+          textEditor.getLastSelection().setBufferRange([[0, startColumn], [numberOfNewlines, endColumn]])
           textEditor.cutSelectedText()
 
         it "pastes text into the buffer", ->
@@ -2832,42 +4035,99 @@ describe "TextEditor", ->
           expect(editor.lineTextForBufferRow(0)).toBe "var first = function () {"
           expect(editor.lineTextForBufferRow(1)).toBe "  var first = function(items) {"
 
+        it "notifies ::onWillInsertText observers", ->
+          insertedStrings = []
+          editor.onWillInsertText ({text, cancel}) ->
+            insertedStrings.push(text)
+            cancel()
+
+          atom.clipboard.write("hello")
+          editor.pasteText()
+
+          expect(insertedStrings).toEqual ["hello"]
+
+        it "notifies ::onDidInsertText observers", ->
+          insertedStrings = []
+          editor.onDidInsertText ({text, range}) ->
+            insertedStrings.push(text)
+
+          atom.clipboard.write("hello")
+          editor.pasteText()
+
+          expect(insertedStrings).toEqual ["hello"]
+
         describe "when `autoIndentOnPaste` is true", ->
           beforeEach ->
-            atom.config.set("editor.autoIndentOnPaste", true)
+            editor.update({autoIndentOnPaste: true})
 
-          describe "when only whitespace precedes the cursor", ->
+          describe "when pasting multiple lines before any non-whitespace characters", ->
             it "auto-indents the lines spanned by the pasted text, based on the first pasted line", ->
-              expect(editor.indentationForBufferRow(5)).toBe(3)
-
               atom.clipboard.write("a(x);\n  b(x);\n    c(x);\n", indentBasis: 0)
               editor.setCursorBufferPosition([5, 0])
               editor.pasteText()
 
-              # Adjust the indentation of the pasted block
+              # Adjust the indentation of the pasted lines while preserving
+              # their indentation relative to each other. Also preserve the
+              # indentation of the following line.
+              expect(editor.lineTextForBufferRow(5)).toBe "      a(x);"
+              expect(editor.lineTextForBufferRow(6)).toBe "        b(x);"
+              expect(editor.lineTextForBufferRow(7)).toBe "          c(x);"
+              expect(editor.lineTextForBufferRow(8)).toBe "      current = items.shift();"
+
+            it "auto-indents lines with a mix of hard tabs and spaces without removing spaces", ->
+              editor.setSoftTabs(false)
               expect(editor.indentationForBufferRow(5)).toBe(3)
-              expect(editor.indentationForBufferRow(6)).toBe(4)
-              expect(editor.indentationForBufferRow(7)).toBe(5)
 
-              # Preserve the indentation of the next row
-              expect(editor.indentationForBufferRow(8)).toBe(3)
+              atom.clipboard.write("/**\n\t * testing\n\t * indent\n\t **/\n", indentBasis: 1)
+              editor.setCursorBufferPosition([5, 0])
+              editor.pasteText()
 
-          describe "when non-whitespace characters precede the cursor", ->
-            it "does not auto-indent the first line being pasted", ->
+              # Do not lose the alignment spaces
+              expect(editor.lineTextForBufferRow(5)).toBe("\t\t\t/**")
+              expect(editor.lineTextForBufferRow(6)).toBe("\t\t\t * testing")
+              expect(editor.lineTextForBufferRow(7)).toBe("\t\t\t * indent")
+              expect(editor.lineTextForBufferRow(8)).toBe("\t\t\t **/")
+
+          describe "when pasting line(s) above a line that matches the decreaseIndentPattern", ->
+            it "auto-indents based on the pasted line(s) only", ->
+              atom.clipboard.write("a(x);\n  b(x);\n    c(x);\n", indentBasis: 0)
+              editor.setCursorBufferPosition([7, 0])
+              editor.pasteText()
+
+              expect(editor.lineTextForBufferRow(7)).toBe "      a(x);"
+              expect(editor.lineTextForBufferRow(8)).toBe "        b(x);"
+              expect(editor.lineTextForBufferRow(9)).toBe "          c(x);"
+              expect(editor.lineTextForBufferRow(10)).toBe "    }"
+
+          describe "when pasting a line of text without line ending", ->
+            it "does not auto-indent the text", ->
+              atom.clipboard.write("a(x);", indentBasis: 0)
+              editor.setCursorBufferPosition([5, 0])
+              editor.pasteText()
+
+              expect(editor.lineTextForBufferRow(5)).toBe "a(x);      current = items.shift();"
+              expect(editor.lineTextForBufferRow(6)).toBe "      current < pivot ? left.push(current) : right.push(current);"
+
+          describe "when pasting on a line after non-whitespace characters", ->
+            it "does not auto-indent the affected line", ->
+              # Before the paste, the indentation is non-standard.
               editor.setText """
-              if (x) {
-                  y();
-              }
+                if (x) {
+                    y();
+                }
               """
 
-              atom.clipboard.write(" z();")
+              atom.clipboard.write(" z();\n h();")
               editor.setCursorBufferPosition([1, Infinity])
+
+              # The indentation of the non-standard line is unchanged.
               editor.pasteText()
               expect(editor.lineTextForBufferRow(1)).toBe("    y(); z();")
+              expect(editor.lineTextForBufferRow(2)).toBe(" h();")
 
         describe "when `autoIndentOnPaste` is false", ->
           beforeEach ->
-            atom.config.set('editor.autoIndentOnPaste', false)
+            editor.update({autoIndentOnPaste: false})
 
           describe "when the cursor is indented further than the original copied text", ->
             it "increases the indentation of the copied lines to match", ->
@@ -2904,7 +4164,7 @@ describe "TextEditor", ->
 
         describe 'when the clipboard has many selections', ->
           beforeEach ->
-            atom.config.set("editor.autoIndentOnPaste", false)
+            editor.update({autoIndentOnPaste: false})
             editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[1, 6], [1, 10]]])
             editor.copySelectedText()
 
@@ -2966,7 +4226,7 @@ describe "TextEditor", ->
       describe "when nothing is selected", ->
         describe "when softTabs is enabled", ->
           it "indents line and retains selection", ->
-            editor.setSelectedBufferRange([[0,3], [0,3]])
+            editor.setSelectedBufferRange([[0, 3], [0, 3]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(0)).toBe "  var quicksort = function () {"
             expect(editor.getSelectedBufferRange()).toEqual [[0, 3 + editor.getTabLength()], [0, 3 + editor.getTabLength()]]
@@ -2975,7 +4235,7 @@ describe "TextEditor", ->
           it "indents line and retains selection", ->
             convertToHardTabs(buffer)
             editor.setSoftTabs(false)
-            editor.setSelectedBufferRange([[0,3], [0,3]])
+            editor.setSelectedBufferRange([[0, 3], [0, 3]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(0)).toBe "\tvar quicksort = function () {"
             expect(editor.getSelectedBufferRange()).toEqual [[0, 3 + 1], [0, 3 + 1]]
@@ -2983,7 +4243,7 @@ describe "TextEditor", ->
       describe "when one line is selected", ->
         describe "when softTabs is enabled", ->
           it "indents line and retains selection", ->
-            editor.setSelectedBufferRange([[0,4], [0,14]])
+            editor.setSelectedBufferRange([[0, 4], [0, 14]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(0)).toBe "#{editor.getTabText()}var quicksort = function () {"
             expect(editor.getSelectedBufferRange()).toEqual [[0, 4 + editor.getTabLength()], [0, 14 + editor.getTabLength()]]
@@ -2992,7 +4252,7 @@ describe "TextEditor", ->
           it "indents line and retains selection", ->
             convertToHardTabs(buffer)
             editor.setSoftTabs(false)
-            editor.setSelectedBufferRange([[0,4], [0,14]])
+            editor.setSelectedBufferRange([[0, 4], [0, 14]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(0)).toBe "\tvar quicksort = function () {"
             expect(editor.getSelectedBufferRange()).toEqual [[0, 4 + 1], [0, 14 + 1]]
@@ -3000,7 +4260,7 @@ describe "TextEditor", ->
       describe "when multiple lines are selected", ->
         describe "when softTabs is enabled", ->
           it "indents selected lines (that are not empty) and retains selection", ->
-            editor.setSelectedBufferRange([[9,1], [11,15]])
+            editor.setSelectedBufferRange([[9, 1], [11, 15]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(9)).toBe "    };"
             expect(buffer.lineForRow(10)).toBe ""
@@ -3008,7 +4268,7 @@ describe "TextEditor", ->
             expect(editor.getSelectedBufferRange()).toEqual [[9, 1 + editor.getTabLength()], [11, 15 + editor.getTabLength()]]
 
           it "does not indent the last row if the selection ends at column 0", ->
-            editor.setSelectedBufferRange([[9,1], [11,0]])
+            editor.setSelectedBufferRange([[9, 1], [11, 0]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(9)).toBe "    };"
             expect(buffer.lineForRow(10)).toBe ""
@@ -3019,7 +4279,7 @@ describe "TextEditor", ->
           it "indents selected lines (that are not empty) and retains selection", ->
             convertToHardTabs(buffer)
             editor.setSoftTabs(false)
-            editor.setSelectedBufferRange([[9,1], [11,15]])
+            editor.setSelectedBufferRange([[9, 1], [11, 15]])
             editor.indentSelectedRows()
             expect(buffer.lineForRow(9)).toBe "\t\t};"
             expect(buffer.lineForRow(10)).toBe ""
@@ -3029,7 +4289,7 @@ describe "TextEditor", ->
     describe ".outdentSelectedRows()", ->
       describe "when nothing is selected", ->
         it "outdents line and retains selection", ->
-          editor.setSelectedBufferRange([[1,3], [1,3]])
+          editor.setSelectedBufferRange([[1, 3], [1, 3]])
           editor.outdentSelectedRows()
           expect(buffer.lineForRow(1)).toBe "var sort = function(items) {"
           expect(editor.getSelectedBufferRange()).toEqual [[1, 3 - editor.getTabLength()], [1, 3 - editor.getTabLength()]]
@@ -3066,14 +4326,14 @@ describe "TextEditor", ->
 
       describe "when one line is selected", ->
         it "outdents line and retains editor", ->
-          editor.setSelectedBufferRange([[1,4], [1,14]])
+          editor.setSelectedBufferRange([[1, 4], [1, 14]])
           editor.outdentSelectedRows()
           expect(buffer.lineForRow(1)).toBe "var sort = function(items) {"
           expect(editor.getSelectedBufferRange()).toEqual [[1, 4 - editor.getTabLength()], [1, 14 - editor.getTabLength()]]
 
       describe "when multiple lines are selected", ->
         it "outdents selected lines and retains editor", ->
-          editor.setSelectedBufferRange([[0,1], [3,15]])
+          editor.setSelectedBufferRange([[0, 1], [3, 15]])
           editor.outdentSelectedRows()
           expect(buffer.lineForRow(0)).toBe "var quicksort = function () {"
           expect(buffer.lineForRow(1)).toBe "var sort = function(items) {"
@@ -3082,7 +4342,7 @@ describe "TextEditor", ->
           expect(editor.getSelectedBufferRange()).toEqual [[0, 1], [3, 15 - editor.getTabLength()]]
 
         it "does not outdent the last line of the selection if it ends at column 0", ->
-          editor.setSelectedBufferRange([[0,1], [3,0]])
+          editor.setSelectedBufferRange([[0, 1], [3, 0]])
           editor.outdentSelectedRows()
           expect(buffer.lineForRow(0)).toBe "var quicksort = function () {"
           expect(buffer.lineForRow(1)).toBe "var sort = function(items) {"
@@ -3095,7 +4355,7 @@ describe "TextEditor", ->
       it "auto-indents the selection", ->
         editor.setCursorBufferPosition([2, 0])
         editor.insertText("function() {\ninside=true\n}\n  i=1\n")
-        editor.getLastSelection().setBufferRange([[2,0], [6,0]])
+        editor.getLastSelection().setBufferRange([[2, 0], [6, 0]])
         editor.autoIndentSelectedRows()
 
         expect(editor.lineTextForBufferRow(2)).toBe "    function() {"
@@ -3169,15 +4429,17 @@ describe "TextEditor", ->
         expect(editor.getLastSelection().isEmpty()).toBeTruthy()
 
       it "does not explode if the current language mode has no comment regex", ->
-        editor.destroy()
+        editor = new TextEditor(buffer: new TextBuffer(text: 'hello'))
+        editor.setSelectedBufferRange([[0, 0], [0, 5]])
+        editor.toggleLineCommentsInSelection()
+        expect(editor.lineTextForBufferRow(0)).toBe "hello"
 
-        waitsForPromise ->
-          atom.workspace.open(null, autoIndent: false).then (o) -> editor = o
-
+      it "does nothing for empty lines and null grammar", ->
         runs ->
-          editor.setSelectedBufferRange([[4, 5], [4, 5]])
+          editor.setGrammar(atom.grammars.grammarForScopeName('text.plain.null-grammar'))
+          editor.setCursorBufferPosition([10, 0])
           editor.toggleLineCommentsInSelection()
-          expect(buffer.lineForRow(4)).toBe "    while(items.length > 0) {"
+          expect(editor.buffer.lineForRow(10)).toBe ""
 
       it "uncomments when the line lacks the trailing whitespace in the comment regex", ->
         editor.setCursorBufferPosition([10, 0])
@@ -3231,6 +4493,63 @@ describe "TextEditor", ->
 
         expect(buffer.lineForRow(0)).not.toContain "foo"
         expect(buffer.lineForRow(0)).toContain "fovar"
+
+      it "restores cursors and selections to their states before and after undone and redone changes", ->
+        editor.setSelectedBufferRanges([
+          [[0, 0], [0, 0]],
+          [[1, 0], [1, 3]],
+        ])
+        editor.insertText("abc")
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[0, 3], [0, 3]],
+          [[1, 3], [1, 3]]
+        ]
+
+        editor.setCursorBufferPosition([0, 0])
+        editor.setSelectedBufferRanges([
+          [[2, 0], [2, 0]],
+          [[3, 0], [3, 0]],
+          [[4, 0], [4, 3]],
+        ])
+        editor.insertText("def")
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[2, 3], [2, 3]],
+          [[3, 3], [3, 3]]
+          [[4, 3], [4, 3]]
+        ]
+
+        editor.setCursorBufferPosition([0, 0])
+        editor.undo()
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[2, 0], [2, 0]],
+          [[3, 0], [3, 0]],
+          [[4, 0], [4, 3]],
+        ]
+
+        editor.undo()
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[0, 0], [0, 0]],
+          [[1, 0], [1, 3]]
+        ]
+
+        editor.redo()
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[0, 3], [0, 3]],
+          [[1, 3], [1, 3]]
+        ]
+
+        editor.redo()
+
+        expect(editor.getSelectedBufferRanges()).toEqual [
+          [[2, 3], [2, 3]],
+          [[3, 3], [3, 3]]
+          [[4, 3], [4, 3]]
+        ]
 
       it "restores the selected ranges after undo and redo", ->
         editor.setSelectedBufferRanges([[[1, 6], [1, 10]], [[1, 22], [1, 27]]])
@@ -3331,14 +4650,145 @@ describe "TextEditor", ->
 
         expect(editor.getCursors().length).toBe 2
         expect(editor.getCursors()).toEqual [cursor1, cursor3]
-        expect(cursor1.getBufferPosition()).toEqual [0,0]
-        expect(cursor3.getBufferPosition()).toEqual [1,2]
+        expect(cursor1.getBufferPosition()).toEqual [0, 0]
+        expect(cursor3.getBufferPosition()).toEqual [1, 2]
+
+    describe ".moveSelectionLeft()", ->
+      it "moves one active selection on one line one column to the left", ->
+        editor.setSelectedBufferRange [[0, 4], [0, 13]]
+        expect(editor.getSelectedText()).toBe 'quicksort'
+
+        editor.moveSelectionLeft()
+
+        expect(editor.getSelectedText()).toBe 'quicksort'
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 3], [0, 12]]
+
+      it "moves multiple active selections on one line one column to the left", ->
+        editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[0, 16], [0, 24]]])
+        selections = editor.getSelections()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'function'
+
+        editor.moveSelectionLeft()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'function'
+        expect(editor.getSelectedBufferRanges()).toEqual [[[0, 3], [0, 12]], [[0, 15], [0, 23]]]
+
+      it "moves multiple active selections on multiple lines one column to the left", ->
+        editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[1, 6], [1, 10]]])
+        selections = editor.getSelections()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'sort'
+
+        editor.moveSelectionLeft()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'sort'
+        expect(editor.getSelectedBufferRanges()).toEqual [[[0, 3], [0, 12]], [[1, 5], [1, 9]]]
+
+      describe "when a selection is at the first column of a line", ->
+        it "does not change the selection", ->
+          editor.setSelectedBufferRanges([[[0, 0], [0, 3]], [[1, 0], [1, 3]]])
+          selections = editor.getSelections()
+
+          expect(selections[0].getText()).toBe 'var'
+          expect(selections[1].getText()).toBe '  v'
+
+          editor.moveSelectionLeft()
+          editor.moveSelectionLeft()
+
+          expect(selections[0].getText()).toBe 'var'
+          expect(selections[1].getText()).toBe '  v'
+          expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [0, 3]], [[1, 0], [1, 3]]]
+
+        describe "when multiple selections are active on one line", ->
+          it "does not change the selection", ->
+            editor.setSelectedBufferRanges([[[0, 0], [0, 3]], [[0, 4], [0, 13]]])
+            selections = editor.getSelections()
+
+            expect(selections[0].getText()).toBe 'var'
+            expect(selections[1].getText()).toBe 'quicksort'
+
+            editor.moveSelectionLeft()
+
+            expect(selections[0].getText()).toBe 'var'
+            expect(selections[1].getText()).toBe 'quicksort'
+            expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [0, 3]], [[0, 4], [0, 13]]]
+
+    describe ".moveSelectionRight()", ->
+      it "moves one active selection on one line one column to the right", ->
+        editor.setSelectedBufferRange [[0, 4], [0, 13]]
+        expect(editor.getSelectedText()).toBe 'quicksort'
+
+        editor.moveSelectionRight()
+
+        expect(editor.getSelectedText()).toBe 'quicksort'
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 5], [0, 14]]
+
+      it "moves multiple active selections on one line one column to the right", ->
+        editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[0, 16], [0, 24]]])
+        selections = editor.getSelections()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'function'
+
+        editor.moveSelectionRight()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'function'
+        expect(editor.getSelectedBufferRanges()).toEqual [[[0, 5], [0, 14]], [[0, 17], [0, 25]]]
+
+      it "moves multiple active selections on multiple lines one column to the right", ->
+        editor.setSelectedBufferRanges([[[0, 4], [0, 13]], [[1, 6], [1, 10]]])
+        selections = editor.getSelections()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'sort'
+
+        editor.moveSelectionRight()
+
+        expect(selections[0].getText()).toBe 'quicksort'
+        expect(selections[1].getText()).toBe 'sort'
+        expect(editor.getSelectedBufferRanges()).toEqual [[[0, 5], [0, 14]], [[1, 7], [1, 11]]]
+
+      describe "when a selection is at the last column of a line", ->
+        it "does not change the selection", ->
+          editor.setSelectedBufferRanges([[[2, 34], [2, 40]], [[5, 22], [5, 30]]])
+          selections = editor.getSelections()
+
+          expect(selections[0].getText()).toBe 'items;'
+          expect(selections[1].getText()).toBe 'shift();'
+
+          editor.moveSelectionRight()
+          editor.moveSelectionRight()
+
+          expect(selections[0].getText()).toBe 'items;'
+          expect(selections[1].getText()).toBe 'shift();'
+          expect(editor.getSelectedBufferRanges()).toEqual [[[2, 34], [2, 40]], [[5, 22], [5, 30]]]
+
+        describe "when multiple selections are active on one line", ->
+          it "does not change the selection", ->
+            editor.setSelectedBufferRanges([[[2, 27], [2, 33]], [[2, 34], [2, 40]]])
+            selections = editor.getSelections()
+
+            expect(selections[0].getText()).toBe 'return'
+            expect(selections[1].getText()).toBe 'items;'
+
+            editor.moveSelectionRight()
+
+            expect(selections[0].getText()).toBe 'return'
+            expect(selections[1].getText()).toBe 'items;'
+            expect(editor.getSelectedBufferRanges()).toEqual [[[2, 27], [2, 33]], [[2, 34], [2, 40]]]
 
   describe 'reading text', ->
     it '.lineTextForScreenRow(row)', ->
       editor.foldBufferRow(4)
       expect(editor.lineTextForScreenRow(5)).toEqual '    return sort(left).concat(pivot).concat(sort(right));'
-      expect(editor.lineTextForScreenRow(100)).not.toBeDefined()
+      expect(editor.lineTextForScreenRow(9)).toEqual '};'
+      expect(editor.lineTextForScreenRow(10)).toBeUndefined()
 
   describe ".deleteLine()", ->
     it "deletes the first line when the cursor is there", ->
@@ -3404,7 +4854,7 @@ describe "TextEditor", ->
     it "deletes the entire file from the bottom up", ->
       count = buffer.getLineCount()
       expect(count).toBeGreaterThan(0)
-      for line in [0...count]
+      for [0...count]
         editor.getLastCursor().moveToBottom()
         editor.deleteLine()
       expect(buffer.getLineCount()).toBe(1)
@@ -3413,7 +4863,7 @@ describe "TextEditor", ->
     it "deletes the entire file from the top down", ->
       count = buffer.getLineCount()
       expect(count).toBeGreaterThan(0)
-      for line in [0...count]
+      for [0...count]
         editor.getLastCursor().moveToTop()
         editor.deleteLine()
       expect(buffer.getLineCount()).toBe(1)
@@ -3432,7 +4882,7 @@ describe "TextEditor", ->
         expect(buffer.lineForRow(6)).toBe(line7)
         expect(buffer.getLineCount()).toBe(count - 1)
 
-    describe "when the line being deleted preceeds a fold, and the command is undone", ->
+    describe "when the line being deleted precedes a fold, and the command is undone", ->
       it "restores the line and preserves the fold", ->
         editor.setCursorBufferPosition([4])
         editor.foldCurrentRow()
@@ -3451,8 +4901,8 @@ describe "TextEditor", ->
         editor.replaceSelectedText {}, -> '123'
         expect(buffer.lineForRow(0)).toBe '123var quicksort = function () {'
 
-        editor.replaceSelectedText {selectWordIfEmpty: true}, -> 'var'
         editor.setCursorBufferPosition([0])
+        editor.replaceSelectedText {selectWordIfEmpty: true}, -> 'var'
         expect(buffer.lineForRow(0)).toBe 'var quicksort = function () {'
 
         editor.setCursorBufferPosition([10])
@@ -3464,6 +4914,12 @@ describe "TextEditor", ->
         editor.setSelectedBufferRange([[0, 1], [0, 3]])
         editor.replaceSelectedText {}, -> 'ia'
         expect(buffer.lineForRow(0)).toBe 'via quicksort = function () {'
+
+      it "replaces the selected text and selects the replacement text", ->
+        editor.setSelectedBufferRange([[0, 4], [0, 9]])
+        editor.replaceSelectedText {}, -> 'whatnot'
+        expect(buffer.lineForRow(0)).toBe 'var whatnotsort = function () {'
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 4], [0, 11]]
 
   describe ".transpose()", ->
     it "swaps two characters", ->
@@ -3485,12 +4941,12 @@ describe "TextEditor", ->
         editor.setCursorScreenPosition([0, 1])
         editor.upperCase()
         expect(editor.lineTextForBufferRow(0)).toBe 'ABC'
-        expect(editor.getSelectedBufferRange()).toEqual [[0, 1], [0, 1]]
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 0], [0, 3]]
 
     describe "when there is a selection", ->
       it "upper cases the current selection", ->
         editor.buffer.setText("abc")
-        editor.setSelectedBufferRange([[0,0], [0,2]])
+        editor.setSelectedBufferRange([[0, 0], [0, 2]])
         editor.upperCase()
         expect(editor.lineTextForBufferRow(0)).toBe 'ABc'
         expect(editor.getSelectedBufferRange()).toEqual [[0, 0], [0, 2]]
@@ -3502,83 +4958,34 @@ describe "TextEditor", ->
         editor.setCursorScreenPosition([0, 1])
         editor.lowerCase()
         expect(editor.lineTextForBufferRow(0)).toBe 'abc'
-        expect(editor.getSelectedBufferRange()).toEqual [[0, 1], [0, 1]]
+        expect(editor.getSelectedBufferRange()).toEqual [[0, 0], [0, 3]]
 
     describe "when there is a selection", ->
       it "lower cases the current selection", ->
         editor.buffer.setText("ABC")
-        editor.setSelectedBufferRange([[0,0], [0,2]])
+        editor.setSelectedBufferRange([[0, 0], [0, 2]])
         editor.lowerCase()
         expect(editor.lineTextForBufferRow(0)).toBe 'abC'
         expect(editor.getSelectedBufferRange()).toEqual [[0, 0], [0, 2]]
 
-  describe "soft-tabs detection", ->
-    it "assigns soft / hard tabs based on the contents of the buffer, or uses the default if unknown", ->
-      waitsForPromise ->
-        atom.workspace.open('sample.js', softTabs: false).then (editor) ->
-          expect(editor.getSoftTabs()).toBeTruthy()
+  describe '.setTabLength(tabLength)', ->
+    it 'clips atomic soft tabs to the given tab length', ->
+      expect(editor.getTabLength()).toBe 2
+      expect(editor.clipScreenPosition([5, 1], clipDirection: 'forward')).toEqual([5, 2])
 
-      waitsForPromise ->
-        atom.workspace.open('sample-with-tabs.coffee', softTabs: true).then (editor) ->
-          expect(editor.getSoftTabs()).toBeFalsy()
+      editor.setTabLength(6)
+      expect(editor.getTabLength()).toBe 6
+      expect(editor.clipScreenPosition([5, 1], clipDirection: 'forward')).toEqual([5, 6])
 
-      waitsForPromise ->
-        atom.workspace.open('sample-with-tabs-and-initial-comment.js', softTabs: true).then (editor) ->
-          expect(editor.getSoftTabs()).toBeFalsy()
+      changeHandler = jasmine.createSpy('changeHandler')
+      editor.onDidChange(changeHandler)
+      editor.setTabLength(6)
+      expect(changeHandler).not.toHaveBeenCalled()
 
-      waitsForPromise ->
-        atom.workspace.open(null, softTabs: false).then (editor) ->
-          expect(editor.getSoftTabs()).toBeFalsy()
-
-  describe '.getTabLength()', ->
-    describe 'when scoped settings are used', ->
-      coffeeEditor = null
-      beforeEach ->
-        waitsForPromise ->
-          atom.packages.activatePackage('language-coffee-script')
-        waitsForPromise ->
-          atom.project.open('coffee.coffee', autoIndent: false).then (o) -> coffeeEditor = o
-
-      afterEach: ->
-        atom.packages.deactivatePackages()
-        atom.packages.unloadPackages()
-
-      it 'returns correct values based on the scope of the set grammars', ->
-        atom.config.set 'editor.tabLength', 6, scopeSelector: '.source.coffee'
-
-        expect(editor.getTabLength()).toBe 2
-        expect(coffeeEditor.getTabLength()).toBe 6
-
-      it 'retokenizes when the tab length is updated via .setTabLength()', ->
-        expect(editor.getTabLength()).toBe 2
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 2
-
-        editor.setTabLength(6)
-        expect(editor.getTabLength()).toBe 6
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 6
-
-        changeHandler = jasmine.createSpy('changeHandler')
-        editor.onDidChange(changeHandler)
-        editor.setTabLength(6)
-        expect(changeHandler).not.toHaveBeenCalled()
-
-      it 'retokenizes when the editor.tabLength setting is updated', ->
-        expect(editor.getTabLength()).toBe 2
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 2
-
-        atom.config.set 'editor.tabLength', 6, scopeSelector: '.source.js'
-        expect(editor.getTabLength()).toBe 6
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 6
-
-      it 'updates the tab length when the grammar changes', ->
-        atom.config.set 'editor.tabLength', 6, scopeSelector: '.source.coffee'
-
-        expect(editor.getTabLength()).toBe 2
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 2
-
-        editor.setGrammar(coffeeEditor.getGrammar())
-        expect(editor.getTabLength()).toBe 6
-        expect(editor.tokenizedLineForScreenRow(5).tokens[0].firstNonWhitespaceIndex).toBe 6
+    it 'does not change its tab length when the given tab length is null', ->
+      editor.setTabLength(4)
+      editor.setTabLength(null)
+      expect(editor.getTabLength()).toBe(4)
 
   describe ".indentLevelForLine(line)", ->
     it "returns the indent level when the line has only leading whitespace", ->
@@ -3588,17 +4995,13 @@ describe "TextEditor", ->
     it "returns the indent level when the line has only leading tabs", ->
       expect(editor.indentLevelForLine("\t\thello")).toBe(2)
 
-    it "returns the indent level when the line has mixed leading whitespace and tabs", ->
+    it "returns the indent level based on the character starting the line when the leading whitespace contains both spaces and tabs", ->
       expect(editor.indentLevelForLine("\t  hello")).toBe(2)
       expect(editor.indentLevelForLine("  \thello")).toBe(2)
       expect(editor.indentLevelForLine("  \t hello")).toBe(2.5)
-      expect(editor.indentLevelForLine("  \t \thello")).toBe(3.5)
-
-  describe "when the buffer is reloaded", ->
-    it "preserves the current cursor position", ->
-      editor.setCursorScreenPosition([0, 1])
-      editor.buffer.reload()
-      expect(editor.getCursorScreenPosition()).toEqual [0,1]
+      expect(editor.indentLevelForLine("    \t \thello")).toBe(4)
+      expect(editor.indentLevelForLine("     \t \thello")).toBe(4)
+      expect(editor.indentLevelForLine("     \t \t hello")).toBe(4.5)
 
   describe "when a better-matched grammar is added to syntax", ->
     it "switches to the better-matched grammar and re-tokenizes the buffer", ->
@@ -3612,11 +5015,11 @@ describe "TextEditor", ->
 
       runs ->
         expect(editor.getGrammar()).toBe atom.grammars.nullGrammar
-        expect(editor.tokenizedLineForScreenRow(0).tokens.length).toBe 1
+        expect(editor.tokensForScreenRow(0).length).toBe(1)
 
         atom.grammars.addGrammar(jsGrammar)
         expect(editor.getGrammar()).toBe jsGrammar
-        expect(editor.tokenizedLineForScreenRow(0).tokens.length).toBeGreaterThan 1
+        expect(editor.tokensForScreenRow(0).length).toBeGreaterThan 1
 
   describe "editor.autoIndent", ->
     describe "when editor.autoIndent is false (default)", ->
@@ -3626,13 +5029,13 @@ describe "TextEditor", ->
           editor.insertText("\n ")
           expect(editor.lineTextForBufferRow(2)).toBe " "
 
-          atom.config.set("editor.autoIndent", false)
+          editor.update({autoIndent: false})
           editor.indent()
           expect(editor.lineTextForBufferRow(2)).toBe "  "
 
     describe "when editor.autoIndent is true", ->
       beforeEach ->
-        atom.config.set("editor.autoIndent", true)
+        editor.update({autoIndent: true})
 
       describe "when `indent` is triggered", ->
         it "auto-indents the line", ->
@@ -3640,7 +5043,7 @@ describe "TextEditor", ->
           editor.insertText("\n ")
           expect(editor.lineTextForBufferRow(2)).toBe " "
 
-          atom.config.set("editor.autoIndent", true)
+          editor.update({autoIndent: true})
           editor.indent()
           expect(editor.lineTextForBufferRow(2)).toBe "    "
 
@@ -3651,8 +5054,8 @@ describe "TextEditor", ->
             editor.insertText('\n')
             expect(editor.indentationForBufferRow(2)).toBe editor.indentationForBufferRow(1) + 1
 
-        describe "when the line preceding the newline does't add a level of indentation", ->
-          it "indents the new line to the same level a as the preceding line", ->
+        describe "when the line preceding the newline doesn't add a level of indentation", ->
+          it "indents the new line to the same level as the preceding line", ->
             editor.setCursorBufferPosition([5, 14])
             editor.insertText('\n')
             expect(editor.indentationForBufferRow(6)).toBe editor.indentationForBufferRow(5)
@@ -3679,7 +5082,7 @@ describe "TextEditor", ->
           editor.insertText('  var this-line-should-be-indented-more\n')
           expect(editor.indentationForBufferRow(1)).toBe 1
 
-          atom.config.set("editor.autoIndent", true)
+          editor.update({autoIndent: true})
           editor.setCursorBufferPosition([2, Infinity])
           editor.insertText('\n')
           expect(editor.indentationForBufferRow(1)).toBe 1
@@ -3732,69 +5135,30 @@ describe "TextEditor", ->
           editor.insertText('foo')
           expect(editor.indentationForBufferRow(2)).toBe editor.indentationForBufferRow(1) + 1
 
-    describe 'when scoped settings are used', ->
-      coffeeEditor = null
-      beforeEach ->
-        waitsForPromise ->
-          atom.packages.activatePackage('language-coffee-script')
-        waitsForPromise ->
-          atom.project.open('coffee.coffee', autoIndent: false).then (o) -> coffeeEditor = o
+  describe "atomic soft tabs", ->
+    it "skips tab-length runs of leading whitespace when moving the cursor", ->
+      editor.update({tabLength: 4, atomicSoftTabs: true})
 
-        runs ->
-          atom.config.set('editor.autoIndent', true, scopeSelector: '.source.js')
-          atom.config.set('editor.autoIndent', false, scopeSelector: '.source.coffee')
+      editor.setCursorScreenPosition([2, 3])
+      expect(editor.getCursorScreenPosition()).toEqual [2, 4]
 
-      afterEach: ->
-        atom.packages.deactivatePackages()
-        atom.packages.unloadPackages()
+      editor.update({atomicSoftTabs: false})
+      editor.setCursorScreenPosition([2, 3])
+      expect(editor.getCursorScreenPosition()).toEqual [2, 3]
 
-      it "does not auto-indent the line for javascript files", ->
-        editor.setCursorBufferPosition([1, 30])
-        editor.insertText("\n")
-        expect(editor.lineTextForBufferRow(2)).toBe "    "
-
-        coffeeEditor.setCursorBufferPosition([1, 18])
-        coffeeEditor.insertText("\n")
-        expect(coffeeEditor.lineTextForBufferRow(2)).toBe ""
-
-  describe "soft and hard tabs", ->
-    afterEach ->
-      atom.packages.deactivatePackages()
-      atom.packages.unloadPackages()
-
-    it "resets the tab style when tokenization is complete", ->
-      editor.destroy()
-
-      waitsForPromise ->
-        atom.project.open('sample-with-tabs-and-leading-comment.coffee').then (o) -> editor = o
-
-      runs ->
-        expect(editor.softTabs).toBe true
-
-      waitsForPromise ->
-        atom.packages.activatePackage('language-coffee-script')
-
-      runs ->
-        expect(editor.softTabs).toBe false
-
-    it "uses hard tabs in Makefile files", ->
-      # FIXME remove once this is handled by a scoped setting in the
-      # language-make package
-
-      waitsForPromise ->
-        atom.packages.activatePackage('language-make')
-
-      waitsForPromise ->
-        atom.project.open('Makefile').then (o) -> editor = o
-
-      runs ->
-        expect(editor.softTabs).toBe false
+      editor.update({atomicSoftTabs: true})
+      editor.setCursorScreenPosition([2, 3])
+      expect(editor.getCursorScreenPosition()).toEqual [2, 4]
 
   describe ".destroy()", ->
-    it "destroys all markers associated with the edit session", ->
-      expect(buffer.getMarkerCount()).toBeGreaterThan 0
+    it "destroys marker layers associated with the text editor", ->
+      buffer.retain()
+      selectionsMarkerLayerId = editor.selectionsMarkerLayer.id
+      foldsMarkerLayerId = editor.displayLayer.foldsMarkerLayer.id
       editor.destroy()
-      expect(buffer.getMarkerCount()).toBe 0
+      expect(buffer.getMarkerLayer(selectionsMarkerLayerId)).toBeUndefined()
+      expect(buffer.getMarkerLayer(foldsMarkerLayerId)).toBeUndefined()
+      buffer.release()
 
     it "notifies ::onDidDestroy observers when the editor is destroyed", ->
       destroyObserverCalled = false
@@ -3802,6 +5166,23 @@ describe "TextEditor", ->
 
       editor.destroy()
       expect(destroyObserverCalled).toBe true
+
+    it "does not blow up when query methods are called afterward", ->
+      editor.destroy()
+      editor.getGrammar()
+      editor.getLastCursor()
+      editor.lineTextForBufferRow(0)
+
+    it "emits the destroy event after destroying the editor's buffer", ->
+      events = []
+      editor.getBuffer().onDidDestroy ->
+        expect(editor.isDestroyed()).toBe(true)
+        events.push('buffer-destroyed')
+      editor.onDidDestroy ->
+        expect(buffer.isDestroyed()).toBe(true)
+        events.push('editor-destroyed')
+      editor.destroy()
+      expect(events).toEqual(['buffer-destroyed', 'editor-destroyed'])
 
   describe ".joinLines()", ->
     describe "when no text is selected", ->
@@ -3875,12 +5256,12 @@ describe "TextEditor", ->
       expect(editor.getSelectedBufferRanges()).toEqual [[[3, 5], [3, 5]], [[9, 0], [14, 0]]]
 
       # folds are also duplicated
-      expect(editor.tokenizedLineForScreenRow(5).fold).toBeDefined()
-      expect(editor.tokenizedLineForScreenRow(7).fold).toBeDefined()
-      expect(editor.tokenizedLineForScreenRow(7).text).toBe "    while(items.length > 0) {"
-      expect(editor.tokenizedLineForScreenRow(8).text).toBe "    return sort(left).concat(pivot).concat(sort(right));"
+      expect(editor.isFoldedAtScreenRow(5)).toBe(true)
+      expect(editor.isFoldedAtScreenRow(7)).toBe(true)
+      expect(editor.lineTextForScreenRow(7)).toBe "    while(items.length > 0) {" + editor.displayLayer.foldCharacter
+      expect(editor.lineTextForScreenRow(8)).toBe "    return sort(left).concat(pivot).concat(sort(right));"
 
-    it "duplicates all folded lines for empty selections on folded lines", ->
+    it "duplicates all folded lines for empty selections on lines containing folds", ->
       editor.foldBufferRow(4)
       editor.setCursorBufferPosition([4, 0])
 
@@ -3911,21 +5292,37 @@ describe "TextEditor", ->
       """
       expect(editor.getSelectedBufferRange()).toEqual [[13, 0], [14, 2]]
 
-  describe ".shouldPromptToSave()", ->
-    it "returns false when an edit session's buffer is in use by more than one session", ->
-      jasmine.unspy(editor, 'shouldPromptToSave')
-      expect(editor.shouldPromptToSave()).toBeFalsy()
-      buffer.setText('changed')
-      expect(editor.shouldPromptToSave()).toBeTruthy()
-
-      editor2 = null
-      waitsForPromise ->
-        atom.project.open('sample.js', autoIndent: false).then (o) -> editor2 = o
-
-      runs ->
-        expect(editor.shouldPromptToSave()).toBeFalsy()
-        editor2.destroy()
-        expect(editor.shouldPromptToSave()).toBeTruthy()
+    it "only duplicates lines containing multiple selections once", ->
+      editor.setText("""
+        aaaaaa
+        bbbbbb
+        cccccc
+        dddddd
+      """)
+      editor.setSelectedBufferRanges([
+        [[0, 1], [0, 2]],
+        [[0, 3], [0, 4]],
+        [[2, 1], [2, 2]],
+        [[2, 3], [3, 1]],
+        [[3, 3], [3, 4]],
+      ])
+      editor.duplicateLines()
+      expect(editor.getText()).toBe("""
+        aaaaaa
+        aaaaaa
+        bbbbbb
+        cccccc
+        dddddd
+        cccccc
+        dddddd
+      """)
+      expect(editor.getSelectedBufferRanges()).toEqual([
+        [[1, 1], [1, 2]],
+        [[1, 3], [1, 4]],
+        [[5, 1], [5, 2]],
+        [[5, 3], [6, 1]],
+        [[6, 3], [6, 4]],
+      ])
 
   describe "when the editor contains surrogate pair characters", ->
     it "correctly backspaces over them", ->
@@ -4026,24 +5423,8 @@ describe "TextEditor", ->
         editor.setIndentationForBufferRow(0, 2.1)
         expect(editor.getText()).toBe("    1\n\t2")
 
-  describe ".reloadGrammar()", ->
-    beforeEach ->
-      waitsForPromise ->
-        atom.packages.activatePackage('language-coffee-script')
-
-    it "updates the grammar based on grammar overrides", ->
-      expect(editor.getGrammar().name).toBe 'JavaScript'
-      atom.grammars.setGrammarOverrideForPath(editor.getPath(), 'source.coffee')
-      callback = jasmine.createSpy('callback')
-      editor.onDidChangeGrammar(callback)
-      editor.reloadGrammar()
-      expect(editor.getGrammar().name).toBe 'CoffeeScript'
-      expect(callback.callCount).toBe 1
-      expect(callback.argsForCall[0][0]).toBe atom.grammars.grammarForScopeName('source.coffee')
-
   describe "when the editor's grammar has an injection selector", ->
     beforeEach ->
-
       waitsForPromise ->
         atom.packages.activatePackage('language-text')
 
@@ -4056,10 +5437,11 @@ describe "TextEditor", ->
 
       runs ->
         grammar = atom.grammars.selectGrammar("text.js")
-        {tokens} = grammar.tokenizeLine("var i; // http://github.com")
+        {line, tags} = grammar.tokenizeLine("var i; // http://github.com")
 
+        tokens = atom.grammars.decodeTokens(line, tags)
         expect(tokens[0].value).toBe "var"
-        expect(tokens[0].scopes).toEqual ["source.js", "storage.modifier.js"]
+        expect(tokens[0].scopes).toEqual ["source.js", "storage.type.var.js"]
 
         expect(tokens[6].value).toBe "http://github.com"
         expect(tokens[6].scopes).toEqual ["source.js", "comment.line.double-slash.js", "markup.underline.link.http.hyperlink"]
@@ -4072,17 +5454,22 @@ describe "TextEditor", ->
         runs ->
           editor.setText("// http://github.com")
 
-          {tokens} = editor.tokenizedLineForScreenRow(0)
-          expect(tokens[1].value).toBe " http://github.com"
-          expect(tokens[1].scopes).toEqual ["source.js", "comment.line.double-slash.js"]
+          tokens = editor.tokensForScreenRow(0)
+          expect(tokens).toEqual [
+            {text: '//', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--punctuation syntax--definition syntax--comment syntax--js']},
+            {text: ' http://github.com', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']}
+          ]
 
         waitsForPromise ->
           atom.packages.activatePackage('language-hyperlink')
 
         runs ->
-          {tokens} = editor.tokenizedLineForScreenRow(0)
-          expect(tokens[2].value).toBe "http://github.com"
-          expect(tokens[2].scopes).toEqual ["source.js", "comment.line.double-slash.js", "markup.underline.link.http.hyperlink"]
+          tokens = editor.tokensForScreenRow(0)
+          expect(tokens).toEqual [
+            {text: '//', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--punctuation syntax--definition syntax--comment syntax--js']},
+            {text: ' ', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']}
+            {text: 'http://github.com', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--markup syntax--underline syntax--link syntax--http syntax--hyperlink']}
+          ]
 
       describe "when the grammar is updated", ->
         it "retokenizes existing buffers that contain tokens that match the injection selector", ->
@@ -4092,25 +5479,37 @@ describe "TextEditor", ->
           runs ->
             editor.setText("// SELECT * FROM OCTOCATS")
 
-            {tokens} = editor.tokenizedLineForScreenRow(0)
-            expect(tokens[1].value).toBe " SELECT * FROM OCTOCATS"
-            expect(tokens[1].scopes).toEqual ["source.js", "comment.line.double-slash.js"]
+            tokens = editor.tokensForScreenRow(0)
+            expect(tokens).toEqual [
+              {text: '//', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--punctuation syntax--definition syntax--comment syntax--js']},
+              {text: ' SELECT * FROM OCTOCATS', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']}
+            ]
 
           waitsForPromise ->
             atom.packages.activatePackage('package-with-injection-selector')
 
           runs ->
-            {tokens} = editor.tokenizedLineForScreenRow(0)
-            expect(tokens[1].value).toBe " SELECT * FROM OCTOCATS"
-            expect(tokens[1].scopes).toEqual ["source.js", "comment.line.double-slash.js"]
+            tokens = editor.tokensForScreenRow(0)
+            expect(tokens).toEqual [
+              {text: '//', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--punctuation syntax--definition syntax--comment syntax--js']},
+              {text: ' SELECT * FROM OCTOCATS', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']}
+            ]
 
           waitsForPromise ->
             atom.packages.activatePackage('language-sql')
 
           runs ->
-            {tokens} = editor.tokenizedLineForScreenRow(0)
-            expect(tokens[2].value).toBe "SELECT"
-            expect(tokens[2].scopes).toEqual ["source.js", "comment.line.double-slash.js", "keyword.other.DML.sql"]
+            tokens = editor.tokensForScreenRow(0)
+            expect(tokens).toEqual [
+              {text: '//', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--punctuation syntax--definition syntax--comment syntax--js']},
+              {text: ' ', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']},
+              {text: 'SELECT', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--keyword syntax--other syntax--DML syntax--sql']},
+              {text: ' ', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']},
+              {text: '*', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--keyword syntax--operator syntax--star syntax--sql']},
+              {text: ' ', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']},
+              {text: 'FROM', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js', 'syntax--keyword syntax--other syntax--DML syntax--sql']},
+              {text: ' OCTOCATS', scopes: ['syntax--source syntax--js', 'syntax--comment syntax--line syntax--double-slash syntax--js']}
+            ]
 
   describe ".normalizeTabsInBufferRange()", ->
     it "normalizes tabs depending on the editor's soft tab/tab length settings", ->
@@ -4128,88 +5527,108 @@ describe "TextEditor", ->
       editor.normalizeTabsInBufferRange([[0, 0], [Infinity, Infinity]])
       expect(editor.getText()).toBe '     '
 
-  describe ".scrollToCursorPosition()", ->
-    it "scrolls the last cursor into view, centering around the cursor if possible and the 'center' option isn't false", ->
-      editor.setCursorScreenPosition([8, 8])
-      editor.setLineHeightInPixels(10)
-      editor.setDefaultCharWidth(10)
-      editor.setHeight(60)
-      editor.setWidth(130)
-      editor.setHorizontalScrollbarHeight(0)
-      expect(editor.getScrollTop()).toBe 0
-      expect(editor.getScrollLeft()).toBe 0
-
-      editor.scrollToCursorPosition()
-      expect(editor.getScrollTop()).toBe (8.5 * 10) - 30
-      expect(editor.getScrollBottom()).toBe (8.5 * 10) + 30
-      expect(editor.getScrollRight()).toBe (9 + editor.getHorizontalScrollMargin()) * 10
-
-      editor.setScrollTop(0)
-      editor.scrollToCursorPosition(center: false)
-      expect(editor.getScrollBottom()).toBe (9 + editor.getVerticalScrollMargin()) * 10
-
   describe ".pageUp/Down()", ->
-    it "scrolls one screen height up or down and moves the cursor one page length", ->
-      editor.setLineHeightInPixels(10)
-      editor.setHeight(50)
-      expect(editor.getScrollHeight()).toBe 130
+    it "moves the cursor down one page length", ->
+      editor.update(autoHeight: false)
+      element = editor.getElement()
+      jasmine.attachToDOM(element)
+      element.style.height = element.component.getLineHeight() * 5 + 'px'
+      element.measureDimensions()
+
       expect(editor.getCursorBufferPosition().row).toBe 0
 
       editor.pageDown()
-      expect(editor.getScrollTop()).toBe 50
       expect(editor.getCursorBufferPosition().row).toBe 5
 
       editor.pageDown()
-      expect(editor.getScrollTop()).toBe 80
       expect(editor.getCursorBufferPosition().row).toBe 10
 
       editor.pageUp()
-      expect(editor.getScrollTop()).toBe 30
       expect(editor.getCursorBufferPosition().row).toBe 5
 
       editor.pageUp()
-      expect(editor.getScrollTop()).toBe 0
       expect(editor.getCursorBufferPosition().row).toBe 0
 
   describe ".selectPageUp/Down()", ->
     it "selects one screen height of text up or down", ->
-      editor.setLineHeightInPixels(10)
-      editor.setHeight(50)
-      expect(editor.getScrollHeight()).toBe 130
+      editor.update(autoHeight: false)
+      element = editor.getElement()
+      jasmine.attachToDOM(element)
+      element.style.height = element.component.getLineHeight() * 5 + 'px'
+      element.measureDimensions()
+
       expect(editor.getCursorBufferPosition().row).toBe 0
 
       editor.selectPageDown()
-      expect(editor.getScrollTop()).toBe 30
-      expect(editor.getSelectedBufferRanges()).toEqual [[[0,0], [5,0]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [5, 0]]]
 
       editor.selectPageDown()
-      expect(editor.getScrollTop()).toBe 80
-      expect(editor.getSelectedBufferRanges()).toEqual [[[0,0], [10,0]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [10, 0]]]
 
       editor.selectPageDown()
-      expect(editor.getScrollTop()).toBe 80
-      expect(editor.getSelectedBufferRanges()).toEqual [[[0,0], [12,2]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [12, 2]]]
 
       editor.moveToBottom()
       editor.selectPageUp()
-      expect(editor.getScrollTop()).toBe 50
-      expect(editor.getSelectedBufferRanges()).toEqual [[[7,0], [12,2]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[7, 0], [12, 2]]]
 
       editor.selectPageUp()
-      expect(editor.getScrollTop()).toBe 0
-      expect(editor.getSelectedBufferRanges()).toEqual [[[2,0], [12,2]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[2, 0], [12, 2]]]
 
       editor.selectPageUp()
-      expect(editor.getScrollTop()).toBe 0
-      expect(editor.getSelectedBufferRanges()).toEqual [[[0,0], [12,2]]]
+      expect(editor.getSelectedBufferRanges()).toEqual [[[0, 0], [12, 2]]]
+
+  describe "::scrollToScreenPosition(position, [options])", ->
+    it "triggers ::onDidRequestAutoscroll with the logical coordinates along with the options", ->
+      scrollSpy = jasmine.createSpy("::onDidRequestAutoscroll")
+      editor.onDidRequestAutoscroll(scrollSpy)
+
+      editor.scrollToScreenPosition([8, 20])
+      editor.scrollToScreenPosition([8, 20], center: true)
+      editor.scrollToScreenPosition([8, 20], center: false, reversed: true)
+
+      expect(scrollSpy).toHaveBeenCalledWith(screenRange: [[8, 20], [8, 20]], options: {})
+      expect(scrollSpy).toHaveBeenCalledWith(screenRange: [[8, 20], [8, 20]], options: {center: true})
+      expect(scrollSpy).toHaveBeenCalledWith(screenRange: [[8, 20], [8, 20]], options: {center: false, reversed: true})
+
+  describe "scroll past end", ->
+    it "returns false by default but can be customized", ->
+      expect(editor.getScrollPastEnd()).toBe(false)
+      editor.update({scrollPastEnd: true})
+      expect(editor.getScrollPastEnd()).toBe(true)
+      editor.update({scrollPastEnd: false})
+      expect(editor.getScrollPastEnd()).toBe(false)
+
+    it "always returns false when autoHeight is on", ->
+      editor.update({autoHeight: true, scrollPastEnd: true})
+      expect(editor.getScrollPastEnd()).toBe(false)
+      editor.update({autoHeight: false})
+      expect(editor.getScrollPastEnd()).toBe(true)
+
+  describe "auto height", ->
+    it "returns true by default but can be customized", ->
+      editor = new TextEditor
+      expect(editor.getAutoHeight()).toBe(true)
+      editor.update({autoHeight: false})
+      expect(editor.getAutoHeight()).toBe(false)
+      editor.update({autoHeight: true})
+      expect(editor.getAutoHeight()).toBe(true)
+      editor.destroy()
+
+  describe "auto width", ->
+    it "returns false by default but can be customized", ->
+      expect(editor.getAutoWidth()).toBe(false)
+      editor.update({autoWidth: true})
+      expect(editor.getAutoWidth()).toBe(true)
+      editor.update({autoWidth: false})
+      expect(editor.getAutoWidth()).toBe(false)
 
   describe '.get/setPlaceholderText()', ->
     it 'can be created with placeholderText', ->
-      TextBuffer = require 'text-buffer'
-      newEditor = new TextEditor
-        buffer: new TextBuffer
+      newEditor = new TextEditor({
         mini: true
         placeholderText: 'yep'
+      })
       expect(newEditor.getPlaceholderText()).toBe 'yep'
 
     it 'models placeholderText and emits an event when changed', ->
@@ -4221,24 +5640,320 @@ describe "TextEditor", ->
       expect(handler).toHaveBeenCalledWith 'OK'
       expect(editor.getPlaceholderText()).toBe 'OK'
 
-  describe ".checkoutHeadRevision()", ->
-    it "reverts to the version of its file checked into the project repository", ->
-      atom.config.set("editor.confirmCheckoutHeadRevision", false)
+  describe 'gutters', ->
+    describe 'the TextEditor constructor', ->
+      it 'creates a line-number gutter', ->
+        expect(editor.getGutters().length).toBe 1
+        lineNumberGutter = editor.gutterWithName('line-number')
+        expect(lineNumberGutter.name).toBe 'line-number'
+        expect(lineNumberGutter.priority).toBe 0
 
-      editor.setCursorBufferPosition([0, 0])
-      editor.insertText("---\n")
-      expect(editor.lineTextForBufferRow(0)).toBe "---"
+    describe '::addGutter', ->
+      it 'can add a gutter', ->
+        expect(editor.getGutters().length).toBe 1 # line-number gutter
+        options =
+          name: 'test-gutter'
+          priority: 1
+        gutter = editor.addGutter options
+        expect(editor.getGutters().length).toBe 2
+        expect(editor.getGutters()[1]).toBe gutter
 
+      it "does not allow a custom gutter with the 'line-number' name.", ->
+        expect(editor.addGutter.bind(editor, {name: 'line-number'})).toThrow()
+
+    describe '::decorateMarker', ->
+      [marker] = []
+
+      beforeEach ->
+        marker = editor.markBufferRange([[1, 0], [1, 0]])
+
+      it 'reflects an added decoration when one of its custom gutters is decorated.', ->
+        gutter = editor.addGutter {'name': 'custom-gutter'}
+        decoration = gutter.decorateMarker marker, {class: 'custom-class'}
+        gutterDecorations = editor.getDecorations
+          type: 'gutter'
+          gutterName: 'custom-gutter'
+          class: 'custom-class'
+        expect(gutterDecorations.length).toBe 1
+        expect(gutterDecorations[0]).toBe decoration
+
+      it 'reflects an added decoration when its line-number gutter is decorated.', ->
+        decoration = editor.gutterWithName('line-number').decorateMarker marker, {class: 'test-class'}
+        gutterDecorations = editor.getDecorations
+          type: 'line-number'
+          gutterName: 'line-number'
+          class: 'test-class'
+        expect(gutterDecorations.length).toBe 1
+        expect(gutterDecorations[0]).toBe decoration
+
+    describe '::observeGutters', ->
+      [payloads, callback] = []
+
+      beforeEach ->
+        payloads = []
+        callback = (payload) ->
+          payloads.push(payload)
+
+      it 'calls the callback immediately with each existing gutter, and with each added gutter after that.', ->
+        lineNumberGutter = editor.gutterWithName('line-number')
+        editor.observeGutters(callback)
+        expect(payloads).toEqual [lineNumberGutter]
+        gutter1 = editor.addGutter({name: 'test-gutter-1'})
+        expect(payloads).toEqual [lineNumberGutter, gutter1]
+        gutter2 = editor.addGutter({name: 'test-gutter-2'})
+        expect(payloads).toEqual [lineNumberGutter, gutter1, gutter2]
+
+      it 'does not call the callback when a gutter is removed.', ->
+        gutter = editor.addGutter({name: 'test-gutter'})
+        editor.observeGutters(callback)
+        payloads = []
+        gutter.destroy()
+        expect(payloads).toEqual []
+
+      it 'does not call the callback after the subscription has been disposed.', ->
+        subscription = editor.observeGutters(callback)
+        payloads = []
+        subscription.dispose()
+        editor.addGutter({name: 'test-gutter'})
+        expect(payloads).toEqual []
+
+    describe '::onDidAddGutter', ->
+      [payloads, callback] = []
+
+      beforeEach ->
+        payloads = []
+        callback = (payload) ->
+          payloads.push(payload)
+
+      it 'calls the callback with each newly-added gutter, but not with existing gutters.', ->
+        editor.onDidAddGutter(callback)
+        expect(payloads).toEqual []
+        gutter = editor.addGutter({name: 'test-gutter'})
+        expect(payloads).toEqual [gutter]
+
+      it 'does not call the callback after the subscription has been disposed.', ->
+        subscription = editor.onDidAddGutter(callback)
+        payloads = []
+        subscription.dispose()
+        editor.addGutter({name: 'test-gutter'})
+        expect(payloads).toEqual []
+
+    describe '::onDidRemoveGutter', ->
+      [payloads, callback] = []
+
+      beforeEach ->
+        payloads = []
+        callback = (payload) ->
+          payloads.push(payload)
+
+      it 'calls the callback when a gutter is removed.', ->
+        gutter = editor.addGutter({name: 'test-gutter'})
+        editor.onDidRemoveGutter(callback)
+        expect(payloads).toEqual []
+        gutter.destroy()
+        expect(payloads).toEqual ['test-gutter']
+
+      it 'does not call the callback after the subscription has been disposed.', ->
+        gutter = editor.addGutter({name: 'test-gutter'})
+        subscription = editor.onDidRemoveGutter(callback)
+        subscription.dispose()
+        gutter.destroy()
+        expect(payloads).toEqual []
+
+  describe "decorations", ->
+    describe "::decorateMarker", ->
+      it "includes the decoration in the object returned from ::decorationsStateForScreenRowRange", ->
+        marker = editor.markBufferRange([[2, 4], [6, 8]])
+        decoration = editor.decorateMarker(marker, type: 'highlight', class: 'foo')
+        expect(editor.decorationsStateForScreenRowRange(0, 5)[decoration.id]).toEqual {
+          properties: {type: 'highlight', class: 'foo'}
+          screenRange: marker.getScreenRange(),
+          bufferRange: marker.getBufferRange(),
+          rangeIsReversed: false
+        }
+
+      it "does not throw errors after the marker's containing layer is destroyed", ->
+        layer = editor.addMarkerLayer()
+        marker = layer.markBufferRange([[2, 4], [6, 8]])
+        decoration = editor.decorateMarker(marker, type: 'highlight', class: 'foo')
+        layer.destroy()
+        editor.decorationsStateForScreenRowRange(0, 5)
+
+    describe "::decorateMarkerLayer", ->
+      it "based on the markers in the layer, includes multiple decoration objects with the same properties and different ranges in the object returned from ::decorationsStateForScreenRowRange", ->
+        layer1 = editor.getBuffer().addMarkerLayer()
+        marker1 = layer1.markRange([[2, 4], [6, 8]])
+        marker2 = layer1.markRange([[11, 0], [11, 12]])
+        layer2 = editor.getBuffer().addMarkerLayer()
+        marker3 = layer2.markRange([[8, 0], [9, 0]])
+
+        layer1Decoration1 = editor.decorateMarkerLayer(layer1, type: 'highlight', class: 'foo')
+        layer1Decoration2 = editor.decorateMarkerLayer(layer1, type: 'highlight', class: 'bar')
+        layer2Decoration = editor.decorateMarkerLayer(layer2, type: 'highlight', class: 'baz')
+
+        decorationState = editor.decorationsStateForScreenRowRange(0, 13)
+
+        expect(decorationState["#{layer1Decoration1.id}-#{marker1.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'foo'},
+          screenRange: marker1.getRange(),
+          bufferRange: marker1.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer1Decoration1.id}-#{marker2.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'foo'},
+          screenRange: marker2.getRange(),
+          bufferRange: marker2.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer1Decoration2.id}-#{marker1.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'bar'},
+          screenRange: marker1.getRange(),
+          bufferRange: marker1.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer1Decoration2.id}-#{marker2.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'bar'},
+          screenRange: marker2.getRange(),
+          bufferRange: marker2.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer2Decoration.id}-#{marker3.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'baz'},
+          screenRange: marker3.getRange(),
+          bufferRange: marker3.getRange(),
+          rangeIsReversed: false
+        }
+
+        layer1Decoration1.destroy()
+
+        decorationState = editor.decorationsStateForScreenRowRange(0, 12)
+        expect(decorationState["#{layer1Decoration1.id}-#{marker1.id}"]).toBeUndefined()
+        expect(decorationState["#{layer1Decoration1.id}-#{marker2.id}"]).toBeUndefined()
+        expect(decorationState["#{layer1Decoration2.id}-#{marker1.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'bar'},
+          screenRange: marker1.getRange(),
+          bufferRange: marker1.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer1Decoration2.id}-#{marker2.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'bar'},
+          screenRange: marker2.getRange(),
+          bufferRange: marker2.getRange(),
+          rangeIsReversed: false
+        }
+        expect(decorationState["#{layer2Decoration.id}-#{marker3.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'baz'},
+          screenRange: marker3.getRange(),
+          bufferRange: marker3.getRange(),
+          rangeIsReversed: false
+        }
+
+        layer1Decoration2.setPropertiesForMarker(marker1, {type: 'highlight', class: 'quux'})
+        decorationState = editor.decorationsStateForScreenRowRange(0, 12)
+        expect(decorationState["#{layer1Decoration2.id}-#{marker1.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'quux'},
+          screenRange: marker1.getRange(),
+          bufferRange: marker1.getRange(),
+          rangeIsReversed: false
+        }
+
+        layer1Decoration2.setPropertiesForMarker(marker1, null)
+        decorationState = editor.decorationsStateForScreenRowRange(0, 12)
+        expect(decorationState["#{layer1Decoration2.id}-#{marker1.id}"]).toEqual {
+          properties: {type: 'highlight', class: 'bar'},
+          screenRange: marker1.getRange(),
+          bufferRange: marker1.getRange(),
+          rangeIsReversed: false
+        }
+
+  describe "invisibles", ->
+    beforeEach ->
+      editor.update({showInvisibles: true})
+
+    it "substitutes invisible characters according to the given rules", ->
+      previousLineText = editor.lineTextForScreenRow(0)
+      editor.update({invisibles: {eol: '?'}})
+      expect(editor.lineTextForScreenRow(0)).not.toBe(previousLineText)
+      expect(editor.lineTextForScreenRow(0).endsWith('?')).toBe(true)
+      expect(editor.getInvisibles()).toEqual(eol: '?')
+
+    it "does not use invisibles if showInvisibles is set to false", ->
+      editor.update({invisibles: {eol: '?'}})
+      expect(editor.lineTextForScreenRow(0).endsWith('?')).toBe(true)
+
+      editor.update({showInvisibles: false})
+      expect(editor.lineTextForScreenRow(0).endsWith('?')).toBe(false)
+
+  describe "indent guides", ->
+    it "shows indent guides when `editor.showIndentGuide` is set to true and the editor is not mini", ->
+      editor.setText("  foo")
+      editor.setTabLength(2)
+
+      editor.update({showIndentGuide: false})
+      expect(editor.tokensForScreenRow(0)).toEqual [
+        {text: '  ', scopes: ['syntax--source syntax--js', 'leading-whitespace']},
+        {text: 'foo', scopes: ['syntax--source syntax--js']}
+      ]
+
+      editor.update({showIndentGuide: true})
+      expect(editor.tokensForScreenRow(0)).toEqual [
+        {text: '  ', scopes: ['syntax--source syntax--js', 'leading-whitespace indent-guide']},
+        {text: 'foo', scopes: ['syntax--source syntax--js']}
+      ]
+
+      editor.setMini(true)
+      expect(editor.tokensForScreenRow(0)).toEqual [
+        {text: '  ', scopes: ['syntax--source syntax--js', 'leading-whitespace']},
+        {text: 'foo', scopes: ['syntax--source syntax--js']}
+      ]
+
+  describe "when the editor is constructed with the grammar option set", ->
+    beforeEach ->
       waitsForPromise ->
-        editor.checkoutHeadRevision()
+        atom.packages.activatePackage('language-coffee-script')
 
-      runs ->
-        expect(editor.lineTextForBufferRow(0)).toBe "var quicksort = function () {"
+    it "sets the grammar", ->
+      editor = new TextEditor({grammar: atom.grammars.grammarForScopeName('source.coffee')})
+      expect(editor.getGrammar().name).toBe 'CoffeeScript'
 
-    describe "when there's no repository for the editor's file", ->
-      it "doesn't do anything", ->
-        editor = new TextEditor({})
-        editor.setText("stuff")
-        editor.checkoutHeadRevision()
+  describe "softWrapAtPreferredLineLength", ->
+    it "soft wraps the editor at the preferred line length unless the editor is narrower or the editor is mini", ->
+      editor.update({
+        editorWidthInChars: 30
+        softWrapped: true
+        softWrapAtPreferredLineLength: true
+        preferredLineLength: 20
+      })
 
-        waitsForPromise -> editor.checkoutHeadRevision()
+      expect(editor.lineTextForScreenRow(0)).toBe 'var quicksort = '
+
+      editor.update({editorWidthInChars: 10})
+      expect(editor.lineTextForScreenRow(0)).toBe 'var '
+
+      editor.update({mini: true})
+      expect(editor.lineTextForScreenRow(0)).toBe 'var quicksort = function () {'
+
+  describe "softWrapHangingIndentLength", ->
+    it "controls how much extra indentation is applied to soft-wrapped lines", ->
+      editor.setText('123456789')
+      editor.update({
+        editorWidthInChars: 8
+        softWrapped: true
+        softWrapHangingIndentLength: 2
+      })
+      expect(editor.lineTextForScreenRow(1)).toEqual '  9'
+
+      editor.update({softWrapHangingIndentLength: 4})
+      expect(editor.lineTextForScreenRow(1)).toEqual '    9'
+
+  describe "::getElement", ->
+    it "returns an element", ->
+      expect(editor.getElement() instanceof HTMLElement).toBe(true)
+
+  describe 'setMaxScreenLineLength', ->
+    it "sets the maximum line length in the editor before soft wrapping is forced", ->
+      expect(editor.getSoftWrapColumn()).toBe(500)
+      editor.update({
+        maxScreenLineLength: 1500
+      })
+      expect(editor.getSoftWrapColumn()).toBe(1500)

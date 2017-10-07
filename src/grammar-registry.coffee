@@ -1,7 +1,10 @@
-{Emitter} = require 'event-kit'
-{includeDeprecatedAPIs, deprecate} = require 'grim'
+_ = require 'underscore-plus'
 FirstMate = require 'first-mate'
 Token = require './token'
+fs = require 'fs-plus'
+Grim = require 'grim'
+
+PathSplitRegex = new RegExp("[/.]")
 
 # Extended: Syntax class holding the grammars used for tokenizing.
 #
@@ -11,18 +14,8 @@ Token = require './token'
 # language-specific comment regexes. See {::getProperty} for more details.
 module.exports =
 class GrammarRegistry extends FirstMate.GrammarRegistry
-  @deserialize: ({grammarOverridesByPath}) ->
-    grammarRegistry = new GrammarRegistry()
-    grammarRegistry.grammarOverridesByPath = grammarOverridesByPath
-    grammarRegistry
-
-  atom.deserializers.add(this)
-
-  constructor: ->
-    super(maxTokensPerLine: 100)
-
-  serialize: ->
-    {deserializer: @constructor.name, @grammarOverridesByPath}
+  constructor: ({@config}={}) ->
+    super(maxTokensPerLine: 100, maxLineLength: 1000)
 
   createToken: (value, scopes) -> new Token({value, scopes})
 
@@ -35,40 +28,103 @@ class GrammarRegistry extends FirstMate.GrammarRegistry
   # * `fileContents` A {String} of text for the file path.
   #
   # Returns a {Grammar}, never null.
-  selectGrammar: (filePath, fileContents) -> super
+  selectGrammar: (filePath, fileContents) ->
+    @selectGrammarWithScore(filePath, fileContents).grammar
 
-  clearObservers: ->
-    @off() if includeDeprecatedAPIs
-    @emitter = new Emitter
+  selectGrammarWithScore: (filePath, fileContents) ->
+    bestMatch = null
+    highestScore = -Infinity
+    for grammar in @grammars
+      score = @getGrammarScore(grammar, filePath, fileContents)
+      if score > highestScore or not bestMatch?
+        bestMatch = grammar
+        highestScore = score
+    {grammar: bestMatch, score: highestScore}
 
-if includeDeprecatedAPIs
-  PropertyAccessors = require 'property-accessors'
-  PropertyAccessors.includeInto(GrammarRegistry)
+  # Extended: Returns a {Number} representing how well the grammar matches the
+  # `filePath` and `contents`.
+  getGrammarScore: (grammar, filePath, contents) ->
+    contents = fs.readFileSync(filePath, 'utf8') if not contents? and fs.isFileSync(filePath)
 
-  {Subscriber} = require 'emissary'
-  Subscriber.includeInto(GrammarRegistry)
+    score = @getGrammarPathScore(grammar, filePath)
+    if score > 0 and not grammar.bundledPackage
+      score += 0.25
+    if @grammarMatchesContents(grammar, contents)
+      score += 0.125
+    score
 
-  # Support old serialization
-  atom.deserializers.add(name: 'Syntax', deserialize: GrammarRegistry.deserialize)
+  getGrammarPathScore: (grammar, filePath) ->
+    return -1 unless filePath
+    filePath = filePath.replace(/\\/g, '/') if process.platform is 'win32'
 
-  # Deprecated: Used by settings-view to display snippets for packages
-  GrammarRegistry::accessor 'propertyStore', ->
-    deprecate("Do not use this. Use a public method on Config")
-    atom.config.scopedSettingsStore
+    pathComponents = filePath.toLowerCase().split(PathSplitRegex)
+    pathScore = -1
 
-  GrammarRegistry::addProperties = (args...) ->
-    args.unshift(null) if args.length is 2
-    deprecate 'Consider using atom.config.set() instead. A direct (but private) replacement is available at atom.config.addScopedSettings().'
-    atom.config.addScopedSettings(args...)
+    fileTypes = grammar.fileTypes
+    if customFileTypes = @config.get('core.customFileTypes')?[grammar.scopeName]
+      fileTypes = fileTypes.concat(customFileTypes)
 
-  GrammarRegistry::removeProperties = (name) ->
-    deprecate 'atom.config.addScopedSettings() now returns a disposable you can call .dispose() on'
-    atom.config.scopedSettingsStore.removeProperties(name)
+    for fileType, i in fileTypes
+      fileTypeComponents = fileType.toLowerCase().split(PathSplitRegex)
+      pathSuffix = pathComponents[-fileTypeComponents.length..-1]
+      if _.isEqual(pathSuffix, fileTypeComponents)
+        pathScore = Math.max(pathScore, fileType.length)
+        if i >= grammar.fileTypes.length
+          pathScore += 0.5
 
-  GrammarRegistry::getProperty = (scope, keyPath) ->
-    deprecate 'A direct (but private) replacement is available at atom.config.getRawScopedValue().'
-    atom.config.getRawScopedValue(scope, keyPath)
+    pathScore
 
-  GrammarRegistry::propertiesForScope = (scope, keyPath) ->
-    deprecate 'Use atom.config.getAll instead.'
-    atom.config.settingsForScopeDescriptor(scope, keyPath)
+  grammarMatchesContents: (grammar, contents) ->
+    return false unless contents? and grammar.firstLineRegex?
+
+    escaped = false
+    numberOfNewlinesInRegex = 0
+    for character in grammar.firstLineRegex.source
+      switch character
+        when '\\'
+          escaped = not escaped
+        when 'n'
+          numberOfNewlinesInRegex++ if escaped
+          escaped = false
+        else
+          escaped = false
+    lines = contents.split('\n')
+    grammar.firstLineRegex.testSync(lines[0..numberOfNewlinesInRegex].join('\n'))
+
+  # Deprecated: Get the grammar override for the given file path.
+  #
+  # * `filePath` A {String} file path.
+  #
+  # Returns a {String} such as `"source.js"`.
+  grammarOverrideForPath: (filePath) ->
+    Grim.deprecate 'Use atom.textEditors.getGrammarOverride(editor) instead'
+    if editor = getEditorForPath(filePath)
+      atom.textEditors.getGrammarOverride(editor)
+
+  # Deprecated: Set the grammar override for the given file path.
+  #
+  # * `filePath` A non-empty {String} file path.
+  # * `scopeName` A {String} such as `"source.js"`.
+  #
+  # Returns undefined
+  setGrammarOverrideForPath: (filePath, scopeName) ->
+    Grim.deprecate 'Use atom.textEditors.setGrammarOverride(editor, scopeName) instead'
+    if editor = getEditorForPath(filePath)
+      atom.textEditors.setGrammarOverride(editor, scopeName)
+    return
+
+  # Deprecated: Remove the grammar override for the given file path.
+  #
+  # * `filePath` A {String} file path.
+  #
+  # Returns undefined.
+  clearGrammarOverrideForPath: (filePath) ->
+    Grim.deprecate 'Use atom.textEditors.clearGrammarOverride(editor) instead'
+    if editor = getEditorForPath(filePath)
+      atom.textEditors.clearGrammarOverride(editor)
+    return
+
+getEditorForPath = (filePath) ->
+  if filePath?
+    atom.workspace.getTextEditors().find (editor) ->
+      editor.getPath() is filePath
